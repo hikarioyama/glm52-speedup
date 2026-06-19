@@ -254,3 +254,17 @@ host-blocking `ggml_backend_synchronize(split_backend)` に落ち、**GPU split 
 - 次手候補(GLM-5.2 で Step1 が break-even 止まりなら): (a) pre-stage 3 input を pack して gen_ib 3→1、(b) join を CPU↔CUDA async copy 化(pinned 前提)。ただし gen_sp/moe_ids は本質。
 
 ### GLM-5.2 実測 [進行中]: `harness/test_glm52_events.sh 4`(baseline vs split k=4 + SYNC_COUNT + dmon, ~12分)
+
+### 単一GPU k-sweep 結果 [実測, 2026-06-19 後継]
+GPU枝が単一link copy律速 → CPU寄り(k↑=GPU expert↓=copy↓)が効くと予測 → 実測で確認:
+| k (CPU experts) | n_gpu | decode t/s | vs baseline 23.74 |
+|---|---|---|---|
+| 4 | 4 | 23.62 | 0.995x (break-even) |
+| 5 | 3 | 24.68 | 1.04x |
+| **6** | **2** | **26.99** | **1.14x** ← 単一GPU最適付近 |
+| 7 | 1 | (測定中) | |
+**含意**: 単一link では GPU expert を 2個程度に絞るのが最適(copy ~0.5GB/token=~10ms が CPU枝6expert と均衡)。+14% は出るが goal 43 には dual-GPU 必須。dual なら copy 帯域2倍で GPU expert を増やせる(k↓)→ さらに上。
+
+### timing 確定値 [GLM-5.2 split k4, GGML_SCHED_SYNC_COUNT=3, steady-state/token]
+in_gpu(GPU待ち,join含)=18ms / cmp_cpu(CPU枝4exp)=10.5ms / cmp_gpu(GPU async発行)=0.5ms / in_cpu(prestage)=5ms。
+→ overlap成立(GPU async)、だが GPU枝が copy律速(~1GB/token/50GB/s)。**dual-GPU 実装済 (commit 8037eeb, env LLAMA_MOE_DUAL_GPU=1)、test_dual_gpu.sh で実測予定**。
