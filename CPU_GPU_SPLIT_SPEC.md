@@ -214,3 +214,43 @@ spike: `harness/sched_overlap.cpp`(独立split=97%), `sched_overlap2.cpp`(共有
 - ❌ CPU dequant のスレッド増 — 24コア飽和済、48(SMT)は逆に 10.5 t/s 崩壊
 - △ CPU dequant カーネル高速化(X5) — compute律速なので理屈上有効だが 24コア飽和済で頭打ち、本案と直交(併用可)
 - △ MTP/投機 — verify が batch増で expert traffic 増、partial offload と相性悪(保留)
+
+---
+
+## ★★ 2026-06-19 後継セッション: 同期削減 本実装 着手 — WAR guard が主犯と確定 → events で除去
+
+### 計測手段(新規): env-gated per-site sync counter
+`ggml-backend.cpp` の `ggml_backend_sched_compute_splits` に `GGML_SCHED_SYNC_COUNT=1` で
+**GPU stream を flush する host-blocking synchronize を site 別に集計**する instrumentation を追加
+(WAR guard / INPUT copy / MoE input_backend / MoE ids 読み / generic fallback ib・sp)。結果に影響なし、off で zero-overhead。
+→ commit `f92b3be` (llama.cpp-glm52 repo)。
+
+### proxy(GLM-4.7-Flash, 46 MoE層全 offload, k=2)で内訳確定 [実測]
+**1 decode token あたりの GPU-flush sync(steady-state cumulative/call):**
+
+| site | baseline(split off) | split ON | split が追加 | per-layer 追加 |
+|---|---|---|---|---|
+| **war**(WARガード 1573) | 49 | 275.5 | **+226.5** | **+4.9/層 ← 最大主犯** |
+| moe_ids(ids 読み) | 0 | 67.95 | +67.95 | +1.5/層(1/層は必要) |
+| gen_ib(pre-stage GPU→CPU) | 92 | 137.3 | +45.3 | +1/層 |
+| gen_sp(join CPU→GPU) | 47 | 47 | 0 | 0(1/層は必要 join 待ち) |
+| **TOT** | **194** | **533.8** | **+339.8** | **+7.4/層** |
+
+→ 手記の「split が層あたり ~6 sync 追加」を裏取り。**WAR guard が圧倒的主犯**。
+真因: `-ot` で `pipeline_parallel` 無効 → `n_copies=1` → WAR guard が `ggml_backend_event_wait`(stream wait)でなく
+host-blocking `ggml_backend_synchronize(split_backend)` に落ち、**GPU split ごとに pipeline flush** → overlap 死。
+
+### Step 1 [実装済・commit `6552024`]: n_copies=1 でも events を確保 → WAR を stream-wait 化
+`ggml_backend_sched_new` の event 確保を `n_copies>1` 限定から **`n_copies>1 || LLAMA_MOE_CPU_SPLIT 有効`** に拡張。
+- WAR guard が `event_wait`(GPU stream の自己 event 待ち=同一 stream FIFO で既に保証される no-op、**host 非ブロック**)に。
+- **`LLAMA_FORCE_PP`(n_copies=4)と違い staging buffer を 4 倍にしない** → GLM-5.2 OOM 回避(これが決定的差)。events は小さい CUDA handle のみ。
+- CPU backend は `event_new`→NULL で安全に従来 sync 路。env off の非 split 運用は events 確保せず=stock 挙動・回帰ゼロ。
+- **proxy 実測: war 275.5 → 0、TOT 533.8 → 258.3、出力 byte 一致(coherent)**。proxy eval 53→63 t/s(CPU 非律速でも改善)。
+
+### 残る同期(Step 1 後, proxy 値)= 大半が本質的に必要
+- moe_ids ~1.5/層(GPU 上 ids 読み, manual も 1/層)、gen_ib ~3/層(pre-stage GPU→CPU, 先頭1個が attention 待ち=必要・残りは idle GPU で安価)、gen_sp ~1/層(join の GPU expert 待ち=必要)。
+- **pre-stage は events 後も必須**: 廃すると CPU 枝が GPU-resident inp/sel/weights を読む→CPU split で synchronize(GPU) が
+  **issue 済の GPU expert 枝を待つ**→overlap 死。pre-stage は GPU→CPU sync を expert 枝 issue **前**(attention 待ちのみ)に移す役。
+- 次手候補(GLM-5.2 で Step1 が break-even 止まりなら): (a) pre-stage 3 input を pack して gen_ib 3→1、(b) join を CPU↔CUDA async copy 化(pinned 前提)。ただし gen_sp/moe_ids は本質。
+
+### GLM-5.2 実測 [進行中]: `harness/test_glm52_events.sh 4`(baseline vs split k=4 + SYNC_COUNT + dmon, ~12分)
