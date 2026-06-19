@@ -1,0 +1,6 @@
+全routed expert params = 734.4B → 222 GB (モデルの主体)
+per-token active: routed=23.0B shared=2.87B attn~8.7B → 計 34.5B
+per-token 読みバイト ≈ 10.4 GB
+  天井 @ 全resident 1.7TB/s: 6.6 ms/tok = 152 tok/s
+  天井 @ Max-Q込み実効0.9TB/s: 12.5 ms/tok = 80 tok/s
+naive offload(29% routed, PCIe 25GB/s): +87 ms/tok → 崩落

@@ -1,0 +1,315 @@
+{
+ "spec": {
+  "summary": "3つのIRを統合し、bit-identity gate付きの順序増分計画にした。核心の設計確定: (A) glm-dsaは別々のffn_{gate,up,down}_exps(merged gate_upは未作成=glm-dsa.cpp:128-130確認、deepseek2.cpp:401が渡すffn_gate_up_expsはglm-dsaではnullptr)を使うので「separate gate/up path」で正しい。(B) build_moe_ffnはoverloadが2本: deepseek2.cpp:388は1st overload(:1310)→2nd overload(:1352)へ委譲。cold引数は両方の末尾にデフォルトnullptrで足す(deepseek2/ocr/mistral4は不変=opt-in原挙動維持)。(C) check_tensor_dims(:862)はGGML_MAX_DIMS全次元一致を強制するのでne2=H(≠256)はcreate_tensor経路を通せない→hot/coldは別tensor自前生成。done_getting_tensors(:1316)のn_created==n_tensors整合は、既存TENSOR_SKIP経路(create_tensor:1102-1107のsize_data-=nbytes; n_created++)と同型の会計を新設して満たす(これが唯一の正攻法、実コードに前例あり)。(D) load_all_data(:1515-1518)のget_weight==nullptr continueは「split experts models」コメント通り、weights_map未登録のhot/coldを自動スキップ=既存ループ無改造。(E) GROVEMOEのid再ベース(cast→scale→cast, llama-graph.cpp:1462-1465)がIR2のmask数式の実在前例。(F) scheduler copy経路(ggml-backend.cpp:1578-1660)のGGML_ASSERT(id>=0 && id<n_expert):1615はcold tensor ne2=H_coldにid>=H_coldを渡すと即死→hot/cold両方でid clamp必須。実装はseparate-tensor+separate-buft方式(view方式は別buft不可で却下)。正しさgate=temp0/seed固定64token greedyのtoken-id列がbaselineとbyte一致。最初の増分は最も安全(2分岐配線をH=256/cold=空でopt-in、baseline完全一致確認)。",
+  "first_increment_detail": "増分1=「配線だけ入れて挙動ゼロ変化を証明」。(1) src/llama-graph.h の 2nd overload宣言(:874の down_exps_s=nullptr の後)に `ggml_tensor * up_exps_cold=nullptr, gate_exps_cold=nullptr, down_exps_cold=nullptr, int64_t n_expert_hot=0` を末尾追加。1st overload(:1310宣言)にも同4引数を末尾追加し、:1339の委譲呼び出しで素通し。(2) src/llama-graph.cpp build_moe_ffn 2nd overload本体冒頭で `const bool moe_split = (up_exps_cold != nullptr && n_expert_hot > 0 && n_expert_hot < n_expert);` を計算。この増分では分岐コードは一切書かず、moe_splitをGGML_UNUSEDするだけ(コンパイル通すため)。(3) deepseek2.cpp:401の呼び出しは変更しない(新引数はデフォルトnullptr/0が効く)。→ diff方針: 純粋な引数追加のみ、計算グラフは1ノードも変わらない。テストコマンド: `cmake --build build -j` 後、baseline生成 `build/bin/llama-cli -m <GLM-5.2-UD-Q2.gguf> -ngl 99 -ot 'ffn_.*_exps=CPU' --temp 0 --seed 1 -n 64 -p \"The capital of France is\" --no-warmup -no-cnv > /tmp/base.txt` を増分前後で2回取り、`diff` でtoken-id列byte一致を確認(grep 'sampled' か logits dump、または --verbose-prompt + 出力textのdiff)。GGUFがまだこのマシンに無い場合は GLM-5.1-UD-Q3(/home/hikari/ダウンロード/にあり、同glm系列で別々exps構造)を代理gateに使い、本番GLM-5.2 watcher着弾後に最終gate。",
+  "increments": [
+   {
+    "n": 1,
+    "title": "build_moe_ffn 2本のoverloadにcold/hot引数を末尾デフォルトで追加(配線のみ・挙動ゼロ変化)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-graph.h",
+     "/home/hikari/src/llama.cpp/src/llama-graph.cpp"
+    ],
+    "detail": "2nd overload宣言(:851-874)と1st overload宣言(:1310)の末尾に up_exps_cold/gate_exps_cold/down_exps_cold=nullptr, n_expert_hot=0 を追加。1st→2ndの委譲(:1339-1349)で素通し。本体には moe_split フラグ計算+GGML_UNUSEDのみ、分岐コードゼロ。deepseek2.cpp/ocr/mistral4は呼び出し不変でデフォルトが効く。",
+    "gate": "GLM代理(5.1-UD-Q3 -ot ffn_.*_exps=CPU)でtemp0/seed1/64token greedyのtoken-id列が増分前baselineとbyte一致",
+    "owner": "opus"
+   },
+   {
+    "n": 2,
+    "title": "layer構造体にffn_{gate,up,down}_exps_coldフィールド追加(宣言のみ・nullptr初期化)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-model.h"
+    ],
+    "detail": "llama_layer 構造体の ffn_*_exps の近傍に ffn_gate_exps_cold/ffn_up_exps_cold/ffn_down_exps_cold を ggml_tensor*=nullptr で追加。どのarchも代入しないのでnullptrのまま。deepseek2.cpp呼び出しにこれらを渡す配線(model.layers[il].ffn_*_exps_cold, n_expert_hot=0)を足すが値は無効。",
+    "gate": "全archでbyte一致継続(代理GLM + 念のためdeepseek2系GGUFがあれば1本)。n_expert_hot=0でmoe_split=false確認",
+    "owner": "sonnet"
+   },
+   {
+    "n": 3,
+    "title": "build_moe_ffn内にhot/cold 2分岐MoE数式を実装(まだ未配線=実行されない)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-graph.cpp"
+    ],
+    "detail": "moe_split==true時のみ: selected_experts(:1458, I32)から GROVEMOE前例(cast→scale→cast)でhot_ids/cold_idsをmask生成。mask_hot=ggml_step(scale_bias(cast(sel,F32), -1, H-0.5)); hot_id=cast(f*mask_hot,I32); cold_id=cast((f-H)*mask_cold,I32)。build_lora_mm_id(up/gate/down_exps, hot_id)とbuild_lora_mm_id(*_cold, cold_id)を別々に。weights(:1495 [1,n_used,n_tok])にmask_hot/mask_cold(同形reshape)をggml_mulして0埋め。down後にhot_experts*weights_hot と cold_experts*weights_cold を作りggml_addで1本のexperts[n_embd,n_used,n_tok]に戻してから既存集約(:1675-1696)へ。norm_w(:1482)/w_scale(:1497)はsplit前なので不変。per-expert scale(_exps_s)はglm-dsaに無い(open question確認要)が、あればH/C軸長で別get_rows。",
+    "gate": "この増分単独ではmoe_split配線がまだ無いのでbyte一致継続(コードは存在するが到達不能)。コンパイル+既存gate",
+    "owner": "opus"
+   },
+   {
+    "n": 4,
+    "title": "loader: 単一GGUF expert slabをhot/cold 2 tensorへbyte境界memcpyで充填(load_expert_slab新設)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-model-loader.cpp",
+     "/home/hikari/src/llama.cpp/src/models/glm-dsa.cpp",
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "glm-dsa.cpp:128-130をH>0で分岐: create_tensor迂回し hot=GPU buft上ggml_new_tensor_3d{n_embd,n_ff_exp,H}, cold=host pinned buft上{n_embd,n_ff_exp,256-H}を直接生成しlayer.*_exps/_coldに保持。create_tensor未経由なのでcheck_tensor_dims(:862)非通過&weights_map未登録。n_created整合: TENSOR_SKIP経路(:1102-1107)と同型に、元の256-slab tensor名分をsize_data-=nbytes&n_created++で会計(新ヘルパ)。データ充填=load_all_data(:1515)後の追加パスで weights_map[src].offs起点に offs+e*nb2 から hotはe∈[0,H), coldはe∈[H,256)をread_raw/memcpy。byte安全=per-expert独立block量子化でnb2がblock境界一致(down_exps ne0=n_ff_exp=2048はQ3_K/IQ block256で割れる:数値確認要)。cold buftはggml_backend_dev_host_buffer_type直接選択(-ot regexはcreate_tensor内処理なので迂回案では効かない)。",
+    "gate": "H=256(cold空)で起動→moe_split=false経路、token-id byte一致。次にH<256だがbuild_moe_ffn配線は増分5前なので、loaderはtensor作るがgraphは旧tensor参照のまま=baseline一致",
+    "owner": "sonnet"
+   },
+   {
+    "n": 5,
+    "title": "deepseek2.cpp呼び出しでglm-dsa時のみcold/H配線を有効化(初の2分岐実行・正しさgateの本番)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/models/deepseek2.cpp"
+    ],
+    "detail": "build_moe_ffn呼び出し(:388-401)に model.layers[il].ffn_{up,gate,down}_exps_cold と n_expert_hot(=H, glm-dsaのみ非0)を渡す。glm-dsa以外はcold=nullptr/H=0でmoe_split=false維持。これで増分3の数式が初めて実行される。env LLAMA_ARG_EXPERT_HOT(増分6)未設定時H=256でcold空=実質baseline。",
+    "gate": "【最重要gate】H=256: token-id byte一致(分岐実行だが全expert hot=数学的に旧経路と同値)。次にH=200程度: 出力が壊れない+H=256と『近い』(完全一致は不要、cold経路の数値再現性は別途cos検証)。deepseek2系GGUFでcold=nullptr経路byte一致(回帰guard)",
+    "owner": "opus"
+   },
+   {
+    "n": 6,
+    "title": "CLI/env: --expert-hot H 受け口 + cold host buft配置のワイヤリング",
+    "files": [
+     "/home/hikari/src/llama.cpp/common/arg.cpp",
+     "/home/hikari/src/llama.cpp/common/common.h",
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "add_opt({'--expert-hot'},int H).set_env('LLAMA_ARG_EXPERT_HOT')を-ncmoe(:2314)近傍に追加。Hをhparamsかmodel load paramsへ伝播しglm-dsa.cpp分岐が読む。cold host pinned確保(GGML_CUDA_NO_PINNED未設定前提)。",
+    "gate": "--expert-hot 256でbyte一致(no-op)、--expert-hot未指定でbyte一致(従来=全GPU or -ot CPU)。H<256でモデルが正常応答",
+    "owner": "sonnet"
+   },
+   {
+    "n": 7,
+    "title": "side-stream prefetch overlap: cold copyをstream0でなく予約side streamへ+event fork/join",
+    "files": [
+     "/home/hikari/src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu"
+    ],
+    "detail": "既存used-expert copy経路(ggml-backend.cpp:1630のset_tensor_async)はcuda_ctx->stream()=stream0固定でcompute直列化。新API ggml_backend_cuda_set_tensor_async_stream(...,stream_no)を追加しcudaMemcpyAsyncを stream(dev, 予約index)へ。cudaEventRecord(prefetch_stream)→compute直前cudaStreamWaitEvent(stream0)でfork/join(既存concurrent_event fork:4244/join:4330と同型、新プリミティブ不要)。GGML_MOE_PREFETCH=0でstream0 fallback。USE_CUDA_GRAPH有効なのでcapture整合に注意(graph外発行 or concurrent_event方式)。stream index予約はGGML_CUDA_MAX_STREAMS=8内でforkと非衝突に明示。",
+    "gate": "【性能gate=正しさ不変】token-id byte一致を保ったままnvidia-smi 30s観測でPCIe RX>>100MB/s(現状)かつ両/片GPU sm util上昇、decode t/s計測。正しさ回帰なし",
+    "owner": "opus"
+   },
+   {
+    "n": 8,
+    "title": "dual-GPU分散: cold expert集合をload-timeでdevice0/1に二分配置",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/models/glm-dsa.cpp",
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "cold tensorを単一host pinnedでなく、半分をdevice0行きhost-pinned/半分device1行きに割り、各々のGPU PCIeで並列copy(115GB/s合算狙い)。scheduler改造でなくload-time split(blast radius小)。layer内で片side deviceしか使わない問題はexpert交互配置で緩和(open question)。layer-ahead prefetchはv1スコープ外。",
+    "gate": "byte一致継続+両GPU PCIe同時稼働をnvidia-smiで確認、aggregate decode t/s目標~50-66。回帰guard: 単GPU構成/deepseek2で従来動作",
+    "owner": "opus"
+   }
+  ],
+  "test_protocol": "bit-identity gate手順(全増分共通): (1) baseline生成は固定設定 `--temp 0 --seed 1 -n 64 --no-warmup -no-cnv -p \"<固定prompt>\"`。決定的token-id列を得るため llama-cli の出力textをdiff、または build_moe_ffn直前で ffn_moe_topk(selected_experts)をcb経由でdump比較も補助に使う。(2) 各増分の前後で同設定2回実行しdiffがゼロbyte=PASS。(3) GLM-5.2-UD-Q2本番GGUFが現在このマシンに未着(watcher稼働中、memory参照)。当面の代理gate=/home/hikari/ダウンロード/GLM-5.1-UD-Q3_K_XL(同glm系列・別々exps構造で配線/loader/graph改造を全て踏む)。回帰guard用にdeepseek2系GGUFが入手できれば cold=nullptr経路のbyte一致も取る。(4) 増分1-6は「H=256(cold空)でbyte完全一致」を必達gate=全expert hotは数学的に旧MoEと同値。H<256のcold経路は『出力が壊れない+H=256と意味的に近い(cos/perplexity)』で評価し、完全byte一致は要求しない(cold再ベースの数値経路が異なるため)。ただしcold経路単体の数値再現性はoffline cos=1.0検証を別途。(5) 増分7-8は性能gate=正しさ(token-id)不変を保ったままnvidia-smi 30s連続観測で両GPU sm util>70%・PCIe RX>>100MB/s・decode t/s向上(目標2x ~50-66 t/s)。(6) ビルドは毎回 `cmake --build build -j`(増分ビルド)、env conda llamacpp-cu131/g++-15/CUDA13.1/SM120。",
+  "regression_guard": "deepseek2/deepseek2ocr/mistral4はglm-dsaとgraph共有(models.h: deepseek2::graph)。回帰防止の三重ガード: (1) cold引数は全て末尾デフォルトnullptr/n_expert_hot=0=opt-in。build_moe_ffn本体は moe_split=(up_exps_cold!=nullptr && n_expert_hot>0 && n_expert_hot<n_expert) がfalseのとき1ノードも追加しない(増分3で分岐ガード)。(2) cold tensor配線(deepseek2.cpp:388)はlayer.ffn_*_exps_cold経由で、glm-dsa以外はload段でnullptrのまま=自動的にmoe_split=false。(3) layer構造体フィールド追加(増分2)はnullptr初期化のみ、他archは代入しない。検証ガード: 各増分でglm代理に加え、入手可能ならdeepseek2系GGUFでもtoken-id byte一致を取り、共有graphの他arch回帰ゼロを実測確認。特に増分5(初の2分岐実行)と増分7(stream改造)は他archへの波及が理論上あり得ないことをコードガード+実測の両方で担保。loader改造(増分4)もH==0/未指定時は完全に従来create_tensor経路(glm-dsa.cpp分岐のelse)=他arch無関係。",
+  "risks": [
+   "GLM-5.2-UD-Q2本番GGUFが現在このマシンに未着(watcher稼働中)。代理のGLM-5.1-UD-Q3で配線は全て踏めるが、UD-Q2固有のexpert量子化type混在(早層IQ系)のbyte境界(特にdown_exps ne0=n_ff_exp=2048がblock256で割れるか)は本番GGUFでgguf dumpして数値確認必須=open question最優先",
+   "done_getting_tensors:1316のn_created==n_tensors整合。create_tensor迂回でhot/coldを作ると元256-slab tensor名がweights_mapに残ったままn_created未計上になる。TENSOR_SKIP同型会計(size_data-=nbytes; n_created++)を正確に1回だけ呼ぶ必要、二重計上/未計上どちらも起動失敗(failed to load model、OOM明示なし)",
+   "scheduler used-expert copy GGML_ASSERT(id>=0 && id<n_expert) ggml-backend.cpp:1615。cold tensor ne2=H_coldにid>=H_coldを渡すと即死。増分3のid clamp(mask)が完璧でないと増分5でクラッシュ。clampとweight=0 maskの二重防御必須",
+   "USE_CUDA_GRAPH有効環境(SM120)。増分7のside-stream cudaMemcpyAsyncをcapture中(cudaStreamBeginCapture:4505)に出すとgraph固定化とids依存動的copyが矛盾。graph外発行 or concurrent_event整合方式が要る。custom all-reduceはSM120でcrash前例(memory)あり、side-stream系も同様の地雷可能性",
+   "topk_moe CUDA fusion(ggml-cuda.cu:3840-3881)がweights mask書き換えでunfuse落ちする可能性。正しさは保たれるがdecode速度劣化の恐れ、要実測",
+   "均一routing(D1実測)ゆえused cold expert数が毎token max張り付き=copy量削減(β)は幻。overlap+置換のみが効く。天井は正直~50-66 t/s(2x)で、layer-ahead prefetch無しのv1で届くか未確定",
+   "dual-GPU分散(増分8)でlayer内片side deviceしか使わないとPCIe 115GB/s合算に届かずexpert交互配置が要るか未検証。最悪v1は片GPU PCIeのみで~33-43 t/s止まり",
+   "per-expert scale _exps_s がglm-dsaに実在するか未確認(glm-dsa.cpp:117-135にcreate無し=scale無しの公算大)。無ければ実装簡潔化、有れば H/C別軸でのget_rows分割が追加で必要"
+  ]
+ },
+ "adv": [
+  {
+   "angle": "数値bit-identityの数式・op実在性、loader byte境界、scheduler clamp の3点を実コードで裏取りし、specの「確定」主張が実際の関数シグネチャ・op semantics と一致するか検証した。",
+   "flaws": [
+    {
+     "flaw": "【致命・設計の根幹崩壊】specの中核数式『hot/cold を別tensorで build_lora_mm_id し、down後に ggml_add で1本の experts[n_embd,n_used,n_tok] に戻す』が ggml の MUL_MAT_ID semantics と矛盾する。build_lora_mm_id→ggml_mul_mat_id は ids の全エントリ(n_expert_used個/token)に対して結果列を生成する(ggml.c:3306 ne={as->ne[1], ids->ne[0]=n_used, b->ne[2]=n_tok})。hot tensor に cold-id(clamp済=ある固定id)を渡すと、その列は『potした別のhot expertの出力』を必ず生成してしまい、ゼロにはならない。spec は『weights に mask_hot/mask_cold を ggml_mul して 0埋め』で消すと言うが、それは weights 適用後(:1669)の話で、down 出力 experts 自体は full n_used 列を持つ。つまり hot path と cold path は両方とも [n_embd, n_used, n_tok] の full tensor を作り、片方を mask 0 してから ggml_add する=計算量2倍(各tokenで n_used 個の hot GEMM + n_used 個の cold GEMM)。『used cold expert だけ copy/compute』という省コストの前提が graph レベルで成立せず、hot側も毎token全n_used分のmul_mat_idを回す。これは性能ゴール(2x)の数値前提を直接壊す。",
+     "severity": "critical"
+    },
+    {
+     "flaw": "【致命・bit-identity 不成立】『H=256(cold空)で全expert hot=数学的に旧経路と同値→byte一致』という最重要gateの前提が偽。moe_split分岐コード(増分3)は selected_experts に cast→scale→cast の mask 演算(F32往復)と ggml_mul(weights,mask) を挿入する。H=256 でも moe_split=true なら『分岐コードが実行される』なら数式が変わり、ggml_step/ggml_scale/F32 cast の丸めが入って旧 argsort_top_k 直結経路と bit 単位で一致する保証がない。spec は増分5 gate で『H=256: 分岐実行だが全expert hot=数学的に旧経路と同値』と書くが、F32 cast→I32 cast の round-trip が恒等である保証(GROVEMOE は整数除算で別目的)も、mask=1 を掛けても ggml_mul が float 乗算ノードを追加して同一 graph にならない事実も無視している。bit-identity は graph 構造同一が条件で、ノード追加した時点で別物。H=256 は『意味的に同じ』止まりで byte-identity gate にはならない。",
+     "severity": "critical"
+    },
+    {
+     "flaw": "【高・id clamp の op が GROVEMOE 前例と非同型】spec は IR2 mask 数式の実在前例として llama-graph.cpp:1462-1465 の GROVEMOE を挙げるが、GROVEMOE は『全idに一律 1/n_group_experts を掛ける無条件 integer-div re-base』であり、specが要求する『id<H ならそのまま、id>=H なら id-H、各々で別tensorをindexし他方は無効化』という条件付き2分岐 re-base とは別物。条件付きを ggml で実現するには ggml_step(cast(sel)-(H-0.5)) 等の閾値 mask が要るが、これは GROVEMOE には存在しない新規構成で『実在前例あり』は誇張。さらに cold_id=cast((f-H)*mask_cold,I32) は hot-id token(mask_cold=0)で cold_id=0 を生む→cold tensor の expert0 を index する→scheduler が expert0 を used 扱いで copy する無駄、かつ down 出力に expert0 の値が出て weights mask 0 で消す前提に依存(前述critical 1と同じ脆さ)。clamp は ASSERT 回避(ggml-backend.cpp:1615 id<n_expert)には効くが正しさは weights mask 一本足打法。",
+     "severity": "high"
+    },
+    {
+     "flaw": "【高・loader が mmap 既定で spec の after-pass memcpy が破綻】spec 増分4 は『load_all_data(:1515)後の追加パスで weights_map[src].offs 起点に memcpy で hot/cold を充填』とするが、llama.cpp は use_mmap が既定 true(:815 で false にするのは direct_io/RPC 等の条件時のみ)。mmap 経路(:1529-1556)では tensor data はファイルの mmap 領域に ggml_backend_tensor_alloc で直貼り(GPU buft なら tensor_set)で、別途 read する『追加パス』の口がない。hot=GPU buft/cold=host pinned に memcpy するには結局 mmap addr + weight->offs + e*nb2 から自前 copy する新コードが必須で、これは『load_all_data ループ無改造で自動スキップ(:1516 continue)』の主張と両立しない。weights_map に hot/cold は未登録だから :1516 で continue=データが一切入らない。spec は『continue=自動スキップ』を loader 無改造の根拠にしているが、スキップされたら充填もされない=未初期化tensorのまま。充填する以上ループ外の専用 copy 経路が必須で『無改造』は誤り。",
+     "severity": "high"
+    },
+    {
+     "flaw": "【中・topk_moe fusion unfuse による性能劣化が risk でなく確定に近い】CUDA topk_moe fusion(ggml-cuda.cu:3618-3638)は MUL_MAT_ID→ADD_ID→MUL_MAT_ID→GLU の固定 op 列を ggml_can_fuse_subgraph で照合する。spec が selected_experts と weights/probs の間に cast/scale/step/mul の mask ノードを挿入すると、この op 列パターンが崩れ fusion 不成立=topk_moe 融合カーネルが落ちる。spec は risk 欄で『可能性』としているが、ops 列照合は厳格(:3623 is_equal)なので挿入すれば確実に外れる。decode 律速が現状 expert RAM read とはいえ、hot 側を GPU 常駐 compute に移した後は topk_moe 融合の有無が効く帯域に入るため『要実測』では甘く、設計時点で fusion を壊さない別配線(mask を probs 経路でなく ids 生成前に閉じ込める等)を要件化すべき。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "【中・done_getting_tensors 会計の TENSOR_SKIP 同型は別経路で成立しない】spec 増分4 は『create_tensor 迂回で hot/cold を ggml_new_tensor_3d 直生成、元256-slab tensor名を TENSOR_SKIP 同型(size_data-=nbytes; n_created++)で会計』とする。だが TENSOR_SKIP 経路(:1101-1109)は create_tensor 内部で『その tensor を作らず会計だけ』進める分岐。元の ffn_*_exps を全く create_tensor しない(迂回)なら n_created は増えず、かつ weights_map には GGUF の元 tensor が残る→n_tensors との突合(done_getting_tensors:1316)で n_created < n_tensors になり起動失敗。spec はこれを『新ヘルパで size_data-=nbytes;n_created++ を正確に1回』で埋めると言うが、create_tensor を一度も呼ばずに ml.n_created を外部から ++ する API は無く(n_created は loader private カウンタ)、結局 create_tensor を TENSOR_SKIP flag 付きで一度呼ぶ必要がある=『create_tensor 迂回』と『TENSOR_SKIP 経路を通す』は排他。設計記述が自己矛盾。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "【中・cold tensor を別 buft 手動生成すると ggml-alloc/backend-sched の管理外になる】spec は hot=GPU buft/cold=host pinned buft で ggml_new_tensor_3d 直生成し layer に保持するが、llama.cpp の tensor は通常 model.ctxs/bufs の per-buft context に属し ggml_backend_alloc_ctx_tensors で一括確保される。ループ外で野良 ggml_new_tensor_3d した tensor は (a) どの ggml_context に属させるか(model の ctx_map に無いと free されない/二重free)、(b) backend scheduler が graph node の src として split 割当する際に buffer 情報を読む——を満たさねばならない。view 方式却下の理由は妥当だが、別tensor手動生成も ctx/buft のライフサイクル統合という未記述の重い配線を要し『blast radius 小』評価は楽観的。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "【低・per-expert scale は glm-dsa に無いと code 上ほぼ確定だが spec は open question 据え置き】glm-dsa.cpp:117-135 に _exps_s 系 create_tensor は存在せず(確認済)、deepseek2.cpp:388-400 の build_moe_ffn 呼び出しも up/gate/down_exps_s を渡していない(末尾 default nullptr)。よって per-expert scale は glm-dsa では nullptr 確定で『有れば H/C 別軸 get_rows』は不要分岐。risk/open question に残すのは無害だが、確定できるものを open のままにしている。",
+     "severity": "low"
+    }
+   ],
+   "survives": false,
+   "fixes": [
+    "数式を別tensor2本→1tensor1パスに作り直す。hot/cold を物理2 tensorに割るのは『データ配置(VRAM常駐 vs host)』の都合であって『計算経路』を割る理由にしない。MUL_MAT_ID は as(expert weight)が単一3D tensorであることを要求する(ggml.c:3299 as->ne[3]==1)ので、hot[..,H]とcold[..,256-H]を別asで2回 mul_mat_id すると必ず full n_used 列が2セット出る。これを避けるには『1つの論理256-expert tensor を物理的に hot/cold 2 buffer に置きつつ MUL_MAT_ID には連続256として見せる』backend 側の split-buffer 対応が本筋だが、ggml-cuda は mul_mat_id で split buffer 非対応(ggml-cuda.cu:2629 ASSERT)。→ 結論: 現アーキでは『used cold expert だけ GPU へ copy して常駐 hot と一緒に1回の mul_mat_id』を実現するには、scheduler の used-expert copy 経路(ggml-backend.cpp:1576-1660)を拡張して『cold slab の used expert を hot tensor 末尾の予備スロットへ動的 copy し、ids を再マップする』方向(=tensor分割でなく動的 staging)に設計転換すべき。spec の『graph で2分岐』は捨てる。",
+    "bit-identity gate を再定義する。H=256 でも moe_split 分岐コードが mask ノードを足すなら byte-identity は原理的に出ない。正攻法は『moe_split=false のとき build_moe_ffn が旧経路と1ノードも違わない』を増分1-2で担保し(これは spec 通り可)、増分3以降は moe_split=true 経路を『H=256 でも mask が恒等(ggml_mul by 1 すら挿入しない)になるよう、H==n_expert を早期 return で旧経路へ落とす』ガードを入れる。すなわち H<256 のときだけ分岐コードに入る。これで H=256 byte-identity と H<256 動作確認を分離できる。",
+    "loader を mmap 前提で書き直す。use_mmap 既定 true 経路で hot(GPU)/cold(host pinned)を充填するには、load_all_data のループ内で『元 ffn_*_exps 名を get_weight で引き、mmap addr+offs から e*nb2 単位で hot/cold それぞれの buffer へ ggml_backend_tensor_set/memcpy する専用分岐』を新設する。spec の『:1516 continue で自動スキップ=無改造』は『充填しない』と同義なので破棄。元 tensor は create_tensor を TENSOR_SKIP 付きで1回呼んで n_created 会計を正規ルートで合わせ(自前 ++ はしない)、その上で hot/cold を model の ctx_map に属する buft context へ ggml_backend_alloc_ctx_tensors 経由で確保する。",
+    "byte境界の検証対象を訂正する。spec の懸念『down_exps ne0=2048 が block256 で割れるか』は expert 軸(ne2)分割には無関係。expert 軸 slab 境界(nb2)は各 expert が独立 block 量子化なので常に block 境界に乗る(これは安全)。本当に確認すべきは『hot/cold 境界 H が任意値のとき e*nb2 offset が量子化 block の途中に来ないか』だが、nb2=1 expert 分の byte size は QK_K=256 整列済(各 expert が独立 super-block 列)なので H 任意で安全。ただし UD-Q2 の早層 IQ 系混在で type ごとに nb2 が異なる点は per-layer に nb2 を読む実装で吸収。gguf dump で各層 type を列挙し nb2%block==0 を assert するだけで足り、これは open question でなく load 時 assert にできる。",
+    "topk_moe fusion を壊さない配線を設計要件に格上げ。mask は probs/weights/selected_experts の op 列(MUL_MAT_ID→ADD_ID→MUL_MAT_ID→GLU)に挿入しない。代わりに上記『動的 staging + ids 再マップ』案なら ids の値だけ書き換え op 列は不変=fusion 維持できる。これも spec の graph2分岐を捨てる根拠になる。",
+    "per-expert scale は glm-dsa で nullptr 確定として open question から除去し、実装を簡素化(コード確認済: glm-dsa.cpp:117-135 に _exps_s 無し、deepseek2.cpp:388-400 で _exps_s 未渡し)。"
+   ]
+  },
+  {
+   "angle": "回帰安全性(共有graph/cold=nullptr/loader)を実コードで裏取りし、bit-identity gate が「split経路を一度も検証しない」設計欠陥を突く検証戦略監査。",
+   "flaws": [
+    {
+     "flaw": "【検証戦略の致命的穴】bit-identity gate が split 数式を一度も検証しない。spec 定義 moe_split=(up_exps_cold!=nullptr && n_expert_hot>0 && n_expert_hot<n_expert)。H=256 のとき 256<256=false → moe_split=false → 旧経路に落ちる。よって増分1-6の必達gate『H=256でbyte一致』は新コードが1ノードも走らない状態を確認しているだけで、増分3/5の hot/cold 2分岐数式の正しさを全く担保しない。split が初めて走る H<256 では spec 自身が『byte一致は要求しない、cos/perplexityで評価』としており、決定的な参照が無い。結果『split経路に bit-exact gate が存在しない』。cold再ベース(f-H)+mask+ggml_add が元の per-slot 集約と厳密一致するかを byte で押さえる手段が設計に無い。offline cos=1.0 も参照実装が未定義で循環。",
+     "severity": "high"
+    },
+    {
+     "flaw": "scheduler used-expert copy 経路(ggml-backend.cpp:1576-1660)が cold host-pinned tensor の mul_mat_id で『自動的に発火する』。これは spec が増分7で再発明しようとしている side-stream prefetch と同じ既存機構。すなわち増分4で cold を host buffer に置いた瞬間、増分7を書く前から既存 copy_experts が走り、GGML_ASSERT(id>=0 && id<n_expert):1615 が n_expert=input->ne[2]=H_cold で cold_id を検査する。増分3の id clamp が1つでも >=H_cold を出すと増分5起動と同時に即死。spec はこのリスクを risks に挙げているが、『既存スケジューラが増分7以前に勝手に発火する』点と『増分7の side-stream は既存機構と二重化/競合する』点を設計に織り込んでいない。",
+     "severity": "high"
+    },
+    {
+     "flaw": "loader 充填(増分4)の mmap 前提が未確定。glm-dsa は -ngl 運用で既定 mmap(llama-model-loader.cpp:1529 use_mmap 分岐)。cold を host-pinned(非mmap)に置くと、元 256-slab は create_tensor を迂回しどのバッファにも無いため、充填元は『mmap addr + weight->offs』か『file->read_raw』のどちらかを明示選択する必要がある。spec は『weights_map[src].offs 起点に read_raw/memcpy』としか書かず、mmap 有効時に file ハンドルが seek 可能か(mmap時 file は読まれない設計)を確認していない。さらに per-expert nb2 が量子化 block 境界(down_exps ne0=2048 が Q3_K/IQ block256で割れるか)に一致するかは本番 GGUF 未着で未検証=byte memcpy が block を割る可能性。",
+     "severity": "high"
+    },
+    {
+     "flaw": "done_getting_tensors:1316 の n_created==n_tensors(=weights_map.size())整合。create_tensor 迂回で元 slab を作らないと n_created が slab数ぶん不足。TENSOR_SKIP 同型会計(size_data-=nbytes; n_created++)を『正確に1回だけ』呼ぶ必要があり、二重計上も未計上も起動失敗(OOM明示なしの failed to load model)。spec は前例ありとするが、新規 hot/cold tensor を load_all_data の ctx 内に作ると get_weight==nullptr で skip される一方、ctx 外に作ると一切 alloc されない(:1514 ggml_get_first_tensor(ctx) ループ依存)。どの ctx に作るかが未指定で、ここを誤ると静かに未充填のまま走り gibberish。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "CUDA graph 無効化条件の見落とし。ggml-cuda.cu:3260 [TAG_MUL_MAT_ID_CUDA_GRAPHS] は MUL_MAT_ID で node->ne[2] > mmvq_mmid_max または非量子化なら graph 無効化。decode(n_tokens=1)では維持されるが、増分8の dual-GPU split buffer は :3253-3254 で『Split buffers are not supported by CUDA graph capture』により graph 完全無効化。spec の『USE_CUDA_GRAPH 有効』前提と増分8の split 配置は両立せず、増分7の graph 整合議論(graph外発行)が増分8で無意味化する。性能天井(2x)見積りが graph 無効下の前提崩れで楽観的。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "topk_moe fusion(ggml-cuda.cu:3392/3837)への影響が未評価のまま『恐れ』止まり。spec 増分3は weights に mask を ggml_mul して 0埋めする。これは weights テンソルの生成系列(:1471-1503 の get_rows→softmax→norm→scale→build_forward_expand)に新ノードを挿入するため、ggml_cuda_topk_moe_fusion の memory-range/edge チェック(check_fusion_memory_ranges)が unfuse に落ちる公算が高い。正しさは保たれるが decode 速度が逆に劣化し、本企画の唯一の目的(高速化)を毀損しうる。risks に1行あるが gate(増分3が速度中立であること)が無い。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "回帰ガードの実測が代理 GLM-5.1 と『入手できれば deepseek2系』に依存し、本筋の回帰対象(deepseek2/deepseek2ocr/mistral4 が deepseek2::graph 共有=models.h)の byte一致が必達 gate になっていない。cold=nullptr/n_expert_hot=0 で opt-in 維持という静的議論は正しい(build_moe_ffn 本体に moe_split=false 時1ノード追加しないことを増分3で保証)が、増分3で『分岐を switch 前の up/cur 構築途中に差し込む』実装次第では has_gate/swiglu_split 経路(:1607)の前提形状を壊しうる。共有 arch の回帰 byte gate を『入手できれば』でなく必須化すべき。",
+     "severity": "medium"
+    },
+    {
+     "flaw": "per-expert scale _exps_s の扱いは妥当(glm-dsa.cpp:128-130 で *_exps_s を create しない=nullptr 確定、:1552/1573/1660 の scale ブロックは全て skip)。spec の『無い公算大→実装簡潔化』は実コードで正しい。これは flaw ではなく spec の open question が解決済みである旨の確認。残るリスクは将来 glm-dsa に scale 追加された場合の H/C 別軸 get_rows 分割のみで現時点 non-issue。",
+     "severity": "low"
+    }
+   ],
+   "survives": false,
+   "fixes": [
+    "split経路に決定的 bit-exact gate を新設する。moe_split 条件を H<=n_expert(=以下)に緩め、H=256 でも split コードを実行しつつ cold集合=空(2nd build_lora_mm_id を 0要素 or 全mask)になるよう数式を組み、その上で『H=256 split-on』が『旧経路』と byte 一致することを必達 gate にする。これで cast→scale→cast→mask→ggml_add の経路が all-hot 退化で恒等になることを byte で証明でき、増分3/5の数式正当性が初めて検証可能になる。現 spec の H=256=split-off では未達。",
+    "scheduler copy 経路と増分7 side-stream の二重化を解消。増分4で cold を host-pinned に置いた時点で既存 ggml-backend.cpp:1576-1660 が選択 copy を発火することを前提に設計し直す。まず『既存スケジューラ任せ(side-stream改造ゼロ)』で正しさ+ベースライン速度を取り、増分7はその実測 PCIe/util を見てから必要性判断。clamp は >=H_cold を絶対に出さないことを GGML_ASSERT(id<H_cold) を自前で先行挿入して静的保証し、:1615 の即死を増分5前に潰す。",
+    "loader 充填の mmap 前提を増分4の最初に確定させる。本番 GGUF 未着でも代理 GLM-5.1 で use_mmap の実値を起動ログで確認し、mmap時は mapping->addr()+weight->offs を、非mmap時は file->read_raw を選ぶ分岐を明示。さらに gguf dump で down_exps の nb2 が量子化 block サイズで割り切れることを per-layer(早層IQ混在含む)で検証し、割れない層が1つでもあれば slab byte memcpy 方式は破綻するので別途 dequant/再量子化経路へ退避する判断を増分4の gate に入れる。",
+    "n_created 会計と ctx 帰属を増分4で1行ずつ確定。hot/cold は load_all_data がイテレートする同一 ctx に作り(get_weight==nullptr で自動 skip される:1516-1518)、元 slab 名は size_data-=nbytes; n_created++ を『各 slab につき厳密に1回』呼ぶヘルパで会計。起動直後に n_created==n_tensors を assert ログで明示し、二重/未計上を即検出。充填漏れ検出のため cold tensor の checksum を1層だけ offline 参照とつき合わせる smoke を増分4 gate に追加。",
+    "増分8(dual-GPU split)は CUDA graph を完全無効化する(:3253)ため、性能天井 2x 見積りを graph 無効前提で引き直すか、split buffer を使わず両 GPU それぞれ独立 host-pinned + 明示 stream で graph を保つ代替を先に評価。増分7/8 の前に『graph が有効か無効か』を nvidia-smi でなく LLAMA_LOG_DEBUG('disabling CUDA graphs') の有無で確定し、無効なら別アーキ(per-device 非split)に切替。",
+    "増分3に『速度中立 gate』を追加。weights への mask mul 挿入後に topk_moe fusion が unfuse していないことを LLAMA_LOG_DEBUG/プロファイラで確認し、unfuse する場合は mask を weights 系列でなく down 出力(experts)側に per-slot で当てる(fusion 対象外ノードに退避)実装へ変更。正しさ不変・fusion 維持を両立させる。",
+    "共有 graph 他arch(deepseek2/ocr/mistral4)の byte 一致を『入手できれば』から必達 gate へ格上げ。最低 deepseek2 系 GGUF を1本確保し、増分5(初の2分岐配線)と増分7(stream)直後に cold=nullptr 経路で 64token byte 一致を必須チェック。確保不能なら増分5以降を block する判断を test_protocol に明記。"
+   ]
+  },
+  {
+   "angle": "Whether the spec's central performance premise — cold-expert PCIe copy hiding behind hot-expert compute to reach 2x (~50-66 t/s) — actually holds given the verified scheduler/CUDA-graph reality, not just whether the wiring compiles.",
+   "flaws": [
+    {
+     "flaw": "FATAL / the reviewer's core suspicion is correct. The spec's own increments 1-6 add NO overlap mechanism; they only split one tensor into hot+cold tensors and re-route ids. The cold copy is still issued by the EXISTING scheduler path (ggml-backend.cpp:1554-1675) which enqueues ggml_backend_tensor_set_async on cuda_ctx->stream()=stream0 (ggml-cuda.cu:3143), and then launches that same split's compute on stream0 at line 1678. Same stream = strict serialization. Worse, line 1570-1574 does ggml_backend_event_wait / synchronize BEFORE the copy to avoid overwriting the input buffer in-use. So copy-then-compute of a split is serial, and the prior split is fenced. Through increment 6 the result is layer-serial CPU->GPU copy in the compute critical path: this is STRICTLY SLOWER than the current D1 baseline (where experts compute on CPU at 50GB/s RAM read with GPU idle), because you now pay PCIe copy AND GPU compute serially per layer with nothing hidden. Net utility of increments 1-6 = negative, not zero. The 'byte-identity at H=256' gate proves correctness but says NOTHING about perf; the spec never gates that incremental perf does not regress.",
+     "severity": "critical"
+    },
+    {
+     "flaw": "The actual overlap lever lives ENTIRELY in increment 7 (side-stream prefetch + event fork/join), and increment 7 collides head-on with the verified environment. USE_CUDA_GRAPH is active (ggml-cuda.cu:4454-4510): during decode the whole compute graph is captured once and replayed via cudaGraphLaunch (4429). The per-expert copy is NOT in the captured graph — it is issued from the host-side scheduler loop every token. For real overlap you must (a) issue the cold copy on a side stream BEFORE the layer's compute and (b) have a dependency edge so compute waits on it. But the scheduler issues the copy immediately before that split's compute, per-layer, with no look-ahead — there is no point in time where a future layer's cold copy can be enqueued while the current layer computes. The existing concurrent_event fork/join machinery (4234-4248) operates INSIDE the captured graph on tensors known at capture time, with a hard GGML_ASSERT(curr_stream_no==0) (4243); the dynamic, id-dependent cold copy is data-dependent per token and cannot be baked into a static captured graph. So increment 7 as scoped ('new set_tensor_async_stream + event fork/join, same as concurrent_event') is not a small wiring change — it requires restructuring the scheduler to prefetch the NEXT layer's experts during the CURRENT layer's compute (the very 'layer-ahead prefetch' the spec explicitly defers to out-of-scope in risks[5] and increment 8). The spec's own scoping contradicts its perf goal: it defers the only thing that creates overlap.",
+     "severity": "critical"
+    },
+    {
+     "flaw": "The 115 GB/s dual-GPU aggregate figure is unachievable for the stated use. (a) 115GB/s is the SUM of two PCIe5 x16 links (~57-64 GB/s each). To hit it both GPUs must copy disjoint halves of the SAME layer's cold experts simultaneously every token. But increment 8 splits experts statically across devices, and the spec itself flags (risk 6, increment 8 'open question') that within a layer only one side's device may be needed -> you get one link, ~33-43 t/s, not 50-66. (b) Even a single PCIe link at ~57GB/s copying 1.7GB/token caps copy time at ~30ms/token = ~33 t/s BEFORE any compute; that already undershoots the 50-66 target unless copy fully overlaps compute, which (per flaw 1/2) it does not in v1. (c) The spec's own risk[5] concedes 'uniform routing => beta traffic-reduction is a mirage, ceiling honestly ~50-66 (2x), uncertain if v1 reaches it.' The body then asserts 2x as the gate target for increments 7-8. The honest reading of the verified facts is that v1 (no layer-ahead prefetch) cannot structurally exceed the larger of {copy-bound, compute-bound} when they are serialized, and serialized is exactly what increments 1-6 deliver. Beating 21.79 t/s @ctx8192 is plausible ONLY in increment 7+8 with true look-ahead prefetch — which is descoped.",
+     "severity": "critical"
+    },
+    {
+     "flaw": "Pinned 53GB host allocation is asserted as a premise ('cold host pinned, GGML_CUDA_NO_PINNED unset') but never validated, and pageable fallback is a silent correctness-preserving / perf-destroying trap. cudaHostAlloc of 53GB can fail or be refused by the kernel (RLIMIT_MEMLOCK, fragmentation, or the CUDA driver capping pinned registrations), in which case the buffer-type falls back to pageable. Pageable host memory forces cudaMemcpyAsync to become effectively SYNCHRONOUS (the driver does a staging copy), which (a) destroys any overlap the side-stream in increment 7 was meant to create and (b) does so invisibly — token output stays byte-identical so every correctness gate passes while perf silently collapses. There is no gate in the protocol that asserts the 53GB pinned allocation actually succeeded as pinned, nor that the copy is genuinely async. This is precisely the 'pageable serialization risk' the reviewer named, and the spec has no detection for it.",
+     "severity": "high"
+    },
+    {
+     "flaw": "The n_created==n_tensors accounting for the create_tensor-bypass (increment 4) is described as 'TENSOR_SKIP-isotype, call once' but is under-specified for a real failure mode: the original 256-expert slab tensor name remains in weights_map AND is what -ot/-ncmoe regex and load_all_data iterate over. The spec says load_all_data's get_weight==nullptr continue will auto-skip hot/cold (they're not in weights_map) — true — but the ORIGINAL slab tensor IS in weights_map and will be loaded into... nothing, since you bypassed create_tensor for it. Either the slab still gets a backing tensor (double memory) or it doesn't and load_all_data dereferences a null/unbacked weight. The 'size_data -= nbytes; n_created++' bookkeeping addresses the context-buffer size accounting but not the weights_map data-load path for the now-orphaned slab name. This is the 'OOM with no explicit message / failed to load model' landmine the spec itself lists, but the mitigation described does not obviously cover the load_all_data side.",
+     "severity": "high"
+    },
+    {
+     "flaw": "topk_moe CUDA fusion (ggml-cuda.cu:3840-3881 per premise) and the new mask-based weight zeroing in increment 3 interact in a way that can both (a) unfuse the topk path (perf loss, spec acknowledges) AND (b) double the MUL_MAT_ID node count (one for hot ids, one for cold ids) every MoE layer x76 layers, roughly doubling the kernel-launch / scheduler split count. With CUDA graphs this inflates capture size and update cost; without overlap benefit (flaws 1-2), this is pure added latency. The spec treats unfuse as 'correctness preserved, speed maybe down, measure later' but does not budget it against the already-thin 2x target.",
+     "severity": "medium"
+    },
+    {
+     "flaw": "The proxy gate model (GLM-5.1-UD-Q3 instead of the absent GLM-5.2-UD-Q2) cannot validate the single most cited byte-safety claim: that per-expert quantized block boundaries (nb2) align such that hot/cold split is a clean memcpy. Q3 (uniform-ish) and UD-Q2 (mixed IQ types in early layers, the spec's own risk[0]) have DIFFERENT block layouts; risk[0] flags down_exps ne0=2048 / block256 divisibility as 'must verify on real GGUF.' So increments 1-6 can pass all proxy gates and still corrupt on the real model. The whole bit-identity test scaffold is validated against the wrong quantization mix.",
+     "severity": "medium"
+    }
+   ],
+   "survives": false,
+   "fixes": [
+    "Reorder and re-scope: the overlap mechanism (a layer-AHEAD prefetch on a side stream) is not increment 7 polish — it is the entire thesis and must be proven FIRST as a throwaway spike before committing to the 8-increment build. Before writing increments 1-6, build a minimal harness that, on the current code, manually prefetches layer N+1's full expert set to a GPU scratch buffer on a side stream during layer N compute, and measure on the proxy GGUF whether decode t/s actually rises above 21.79. If a hand-rolled prefetch cannot beat baseline, the load-time-split plumbing (increments 1-6) is wasted effort.",
+    "Add an explicit PERF non-regression gate to every increment, not just correctness. Specifically gate increments 1-6 with: 'decode t/s must be >= baseline - epsilon.' This will immediately surface that increments 1-6 alone regress (serial copy+compute on stream0), forcing the design to confront that no value is delivered until the prefetch lands. The current 'byte-identity only' gate masks a perf regression.",
+    "Confront the CUDA-graph constraint directly in the design, not as a risk footnote. Decide explicitly: either (a) keep the cold copy OUT of the captured graph and prefetch from the scheduler one layer ahead (requires scheduler look-ahead across splits — a real change to ggml_backend_sched_compute_splits, not a CUDA-only change to increment 7), or (b) accept that with CUDA graphs active the per-token data-dependent copy cannot overlap and disable CUDA graph for MoE layers (measure the graph-disable penalty first, since SM120 decode leans on graphs).",
+    "Add a hard pinned-allocation assertion + async-copy verification gate. After allocating the ~53GB cold host buffer, assert it is genuinely pinned (query the buffer type / attempt cudaHostGetDevicePointer or check the allocation succeeded as cudaHostAlloc, not malloc fallback) and FAIL LOUDLY if it falls back to pageable. Separately, in the perf gate, confirm via nvidia-smi/nsys that the copy stream and compute stream actually overlap in time — byte-identity is necessary but cannot detect pageable serialization.",
+    "Recompute the honest ceiling with single-link math and put it in the spec body, not buried in risks. At ~57GB/s one PCIe link, 1.7GB/token => ~30ms => ~33 t/s copy-bound; only with TRUE dual-link disjoint copy AND full compute overlap does ~50-66 become reachable. State the dual-GPU per-layer disjointness requirement (increment 8's 'expert interleave') as a v1 PREREQUISITE for the 2x claim, or lower the v1 target to the single-link, prefetch-overlapped number (~33-43 t/s) and label 2x as v2.",
+    "Resolve the weights_map orphan for the bypassed slab tensor before increment 4: confirm by reading load_all_data and the -ot/-ncmoe regex path whether the original 256-slab tensor name, left in weights_map without a create_tensor backing, gets dereferenced. If so, either remove it from weights_map after the split fill, or back it and free it. Add a gate that the loader reports the expected total bytes loaded == file expert bytes (no double-count, no orphan).",
+    "Obtain or synthesize a UD-Q2-equivalent mixed-IQ GGUF (or extract just a few MoE layers from one) before claiming byte-safety, since the GLM-5.1-Q3 proxy provably has a different block layout than the real target's early-layer IQ mix. At minimum, run a standalone offline check that for the real UD-Q2 tensor types, nb2 is an integer multiple of the block size for the chosen H split, and treat that as a blocking open question (the spec already names it top-priority but proceeds to scope all increments around the proxy)."
+   ]
+  }
+ ],
+ "final": {
+  "summary": "敵対レビュー3本は全てsurvives=false、実コードでfatalを裏取り確定。元specの中核thesis(load-time tensor-split + graph2分岐)は破綻ゆえ破棄し、spike-first/既存機構活用へ作り直した。確定事実(実コード): (1) ggml_cuda_mul_mat_idはsrc0がsplit buffer不可(ggml-cuda.cu:2629 GGML_ASSERT)。hot/coldを別asで2回mul_mat_idするとfull[n_ff,n_used,n_tok]が2セット出る(llama-graph.cpp:1543/1561)=計算2倍で省コスト崩壊。weights mask 0埋めはdown出力のfull列を消せない。(2) H=256でbyte一致gateは偽。moe_split数式はcast/scale/cast/mulノードを追加しgraph構造が変わるのでbit-identity不成立(GROVEMOE:1462は無条件integer-divで前例にならない)。(3) 既存schedulerがused-expertだけcopyをalready実装(ggml-backend.cpp:1576-1660)。発火条件=MUL_MAT_ID && input host WEIGHTS buffer && GPU split。D1不発火はexpertがCPU計算でhost-WEIGHTS経路に乗らないため。copyはstream0(set_tensor_async:1630)→同split computeもstream0=直列。元spec増分4-6はoverlap無=直列copy+computeでbaseline以下。(4) split bufferはCUDA graph完全無効化(ggml-cuda.cu:3253)=2x天井崩れる。(5) per-expert scaleはglm-dsaにnullptr確定(glm-dsa.cpp:128-130/deepseek2.cpp:388-400)。正しいthesis=既存copy_experts経路を発火(offload expertをhost-pinned WEIGHTS bufferへ)+overlapさせる=tensor splitでなく配置。最初の増分はspike(プラミング前にbaseline 21.79 t/s超えを実証)。",
+  "first_increment_detail": "増分0=throwaway spike。コードを書く前にthesisをde-risk。MoE expert tensorのVRAM溢れ分をCPU bufferでなくggml_backend_cuda_host_buffer_type(pinned,WEIGHTS usage)へ割り当てる最小パッチをenv GLMDSA_EXPERT_HOST=1でgate。これでggml-backend.cpp:1580 is_host(input->buffer)==trueとなり既存copy_experts(:1576-1660)がused-expertだけstream0へcopy(GPU計算+host weight)。nvidia-smi dmon -s pu -d 1を30s観測しPCIe RXが数十GB/sに上がるか、sm util上昇、decode t/sが21.79@ctx8192超えか測定。LLAMA_LOG_DEBUGで'disabling CUDA graphs'有無も記録。gate:t/s>=baselineなら本プラミングへ、未満ならoverlap機構を本体と認識し増分組替。-ncmoe(arg.cpp:2314近傍)の既存host/device振り分けを流用しexpert host配置の注入経路を特定。テスト:代理 /home/hikari/ダウンロード/GLM-5.1-UD-Q3_K_XL で GLMDSA_EXPERT_HOST=1 build/bin/llama-cli -m <gguf> -ngl 99 --temp 0 --seed 1 -n 64 -p 'The capital of France is' --no-warmup -no-cnv と非設定版のt/s+dmonを比較、temp0出力diffでbyte一致(配置が正しさ不変)も確認。捨てコード前提。",
+  "increments": [
+   {
+    "n": 0,
+    "title": "[SPIKE] offload expertをhost-pinned WEIGHTS bufferに置き既存copy_experts発火、overlapでbaseline超えを実測",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "プラミング前thesis de-risk。expert tensorのVRAM溢れ分をCPUでなくcuda_host_buffer_type(pinned WEIGHTS)へ。ggml-backend.cpp:1580 is_host真→既存copy_experts(:1576-1660)発火。nvidia-smi dmonでPCIe RX/sm util、decode t/sをbaseline(21.79@ctx8192)と比較。stream0直列で遅化ならoverlapが本体と確定。-ncmoe(arg.cpp:2314近傍+llama-model.cpp buft override)流用。捨てコード、env GLMDSA_EXPERT_HOST gate。",
+    "gate": "代理GLM-5.1で(a)temp0 byte一致(配置が正しさ不変)(b)t/s+dmonをbaseline比較。t/s>=baseline&PCIe発火→進行、未満→overlap先行で組替",
+    "owner": "opus"
+   },
+   {
+    "n": 1,
+    "title": "[de-risk] copy_expertsのcopyをside-streamへ逃がしcomputeとoverlap、capture整合を冒頭確定",
+    "files": [
+     "/home/hikari/src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu",
+     "/home/hikari/src/llama.cpp/ggml/src/ggml-backend.cpp"
+    ],
+    "detail": "set_tensor_async(:1630)がstream0固定でcompute直列。冒頭でLLAMA_LOG_DEBUG('disabling CUDA graphs')有無を確認しgraph有効性を確定(host-weight MUL_MAT_IDでggml-cuda.cu:3260-3268条件により既に無効の可能性、その場合side-streamは単純stream分離)。graph有効ならcopyをside-stream+cudaEventRecord→compute前cudaStreamWaitEventでfork/join。ただし同splitのcopy/computeは依存しoverlapせず真のhidingはlook-ahead(増分2)が要る。v1はside-stream分離でstream0他computeと部分overlapするか測る。GGML_MOE_PREFETCH=0でstream0 fallback。",
+    "gate": "byte一致不変+nvidia-smi dmon/nsysでcopy/compute stream時間overlap確認+t/sが増分0比向上。graph有効無効をLOG記録",
+    "owner": "opus"
+   },
+   {
+    "n": 2,
+    "title": "[必要時] scheduler look-ahead prefetch: 同token内後続MoE layerのused-expertをside-stream先読み",
+    "files": [
+     "/home/hikari/src/llama.cpp/ggml/src/ggml-backend.cpp"
+    ],
+    "detail": "増分1で同split overlapでは不足と出た場合のみ。ggml_backend_sched_compute_splitsで現split compute発行後、次MoE splitのinput(host WEIGHTS)のused-expertを予測side-stream copy。decode逐次でtoken跨ぎ予測不可ゆえ同token内後続layer先読みが現実窓。元specがout-of-scopeに逃がしたoverlap本体。env gate+fallback必須。",
+    "gate": "byte一致不変+t/sが増分1比向上+dmonでPCIe/sm util時間重なり確認。prefetch OFFで増分1と同一",
+    "owner": "opus"
+   },
+   {
+    "n": 3,
+    "title": "[配置] VRAM hot/host-cold境界Hを起動flag化(tensor splitでなくbuft割当選択)",
+    "files": [
+     "/home/hikari/src/llama.cpp/common/arg.cpp",
+     "/home/hikari/src/llama.cpp/common/common.h",
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "増分0配置をenv hackでなく--expert-hot H CLI化。tensorを物理splitせずper-tensorでhost/device選択(expert軸H個だけVRAMの細粒度はMUL_MAT_ID split-buffer非対応ggml-cuda.cu:2629で不可)。粒度はlayer/tensor単位host/device振り分け=既存-ncmoe(:2314近傍)拡張、新規graph分岐不要。元spec増分2-6(layerフィールド/loader memcpy/2分岐数式)が全て不要に。",
+    "gate": "全expert VRAM(H=max)でbyte一致+baseline動作。H下げるとhost溢れcopy_experts発火、出力正常。deepseek2系で従来動作不変(opt-in)",
+    "owner": "sonnet"
+   },
+   {
+    "n": 4,
+    "title": "[dual-GPU] host-cold expertをdevice0/1のhost-pinnedに二分しlayer単位交互で両PCIe link並列(split buffer不使用)",
+    "files": [
+     "/home/hikari/src/llama.cpp/src/llama-model.cpp"
+    ],
+    "detail": "split bufferはCUDA graph無効化(ggml-cuda.cu:3253)ゆえ使わない。layerをdevice0/1交互割当(layer-parallel配置)し各deviceが自host-pinnedから自PCIe link copy。両linkが別layerのcopyで同時稼働しうる(同layer内同時はlook-ahead前提)。layer内expert分割はMUL_MAT_ID制約で不可ゆえlayer単位交互へ。天井:単link~57GB/sで1.7GB/token=~30ms=~33 t/s、両link真overlapで~50-66。v1目標~33-43、2xはlook-ahead成功時のみ。",
+    "gate": "byte一致継続+両GPU PCIe同時稼働をdmon確認。t/s目標~33-43(v1)/~50-66(v2)。単GPU/deepseek2で従来動作",
+    "owner": "opus"
+   }
+  ],
+  "test_protocol": "(0)全thesisは増分0 spikeで先にde-risk:プラミング前にcopy_experts発火+overlapのbaseline超えを実測、超えなければ組替。(1)正しさgate:--temp 0 --seed 1 -n 64 --no-warmup -no-cnv -p固定で出力textをdiff、ゼロbyte=PASS。重要訂正:本案はbuild_moe_ffn graphを変えず(host/device配置差のみ)copy元は同じ量子化slabなのでhost配置でもtoken-id byte一致するはず=元spec(graph2分岐でH<256 byte非一致)より強い検証性、全増分でbyte一致を必達gate化できる。(2)graph有効無効はnvidia-smiでなくLLAMA_LOG_DEBUG 'disabling CUDA graphs'有無で判定し各増分記録(split buffer不使用でgraph維持想定だがMUL_MAT_ID条件ggml-cuda.cu:3260-3268で無効化されうる)。(3)pinned確保検証:cudaHostAlloc成功か起動時assert/log、pageable fallbackはcudaMemcpyAsyncを同期化しoverlapを不可視に潰す(byte一致のまま遅化)ので確保失敗をLOUD fail。(4)overlap実証:性能gateはnvidia-smi dmon -s pu -d 1を30s連続観測しPCIe RX(数十GB/s)+copy/compute stream時間overlap(可能ならnsys)+t/s向上。byte一致はpageable serializationを検出できないのでoverlapは別途実測。(5)代理gate:本番GLM-5.2-UD-Q2未着、配置/copy/stream改造は代理GLM-5.1-UD-Q3_K_XLで全経路を踏める(本案はtensorを割らずslab丸ごと配置=量子化byte境界に非依存、元specのnb2 block割り懸念は本案で非該当)。deepseek2系GGUFあればhost配置OFFでbyte一致確認。(6)ビルド毎回cmake --build build -j、env conda llamacpp-cu131/g++-15/CUDA13.1/SM120。",
+  "regression_guard": "本案は元specのbuild_moe_ffn graph 2分岐を破棄したので共有graph(deepseek2/deepseek2ocr/mistral4, models.hでdeepseek2::graph共有)への波及面が激減=最大の回帰リスクが構造的に消えた。残るguard:(1)増分0/3のbuft配置はllama-model.cpp tensor割当のみでgraph builder不変、-ot/-ncmoeと同仕組み、glm-dsa以外は--expert-hot未指定で従来buft=完全opt-in。(2)増分1/2のscheduler/CUDA copy改造(ggml-backend.cpp/ggml-cuda.cu)は全arch共通経路で最も危険。GGML_MOE_PREFETCH=0で従来stream0経路に完全fallback、既存copy_experts(host-weight MUL_MAT_ID)を使う全MoEモデルでbyte一致+t/s非回帰を必達gate。look-ahead(増分2)はenv gate必須、OFFで増分1とbit同一。(3)split bufferはCUDA graph破壊(ggml-cuda.cu:3253)ゆえ増分4で不使用=graph維持でSM120 decode保護。(4)検証:各増分で代理GLM+入手可能ならdeepseek2系GGUF両方で64token byte一致。特に増分1/2(全arch共通copy/stream改造)直後は他MoEモデル(Step3.7/MiniMax手元GGUFあれば)でもhost-offload構成でbyte一致+非回帰を実測。",
+  "risks": [
+   "増分0 spikeがbaseline未満になる公算が高い:既存copy_expertsはstream0直列(set_tensor_async→同split computeが同stream)でcopyがcomputeをhideできずCPU RAM read 50GB/s(GPU遊休)より遅くなりうる。その場合overlap(増分1/2)が必須前提でv1スコープ膨張。元specが増分7に逃がした本体を先頭で直視。",
+   "真のoverlapにはlayer-ahead prefetch(増分2 scheduler改造)が要る。decode逐次でtoken跨ぎ予測不可、同token内後続MoE layer先読みのみが窓。窓が狭くhide量不足なら2x未達。天井は単link~33 t/s、両link真overlapで~50-66。look-ahead失敗ならv1はbaseline同等〜微増の恐れ。",
+   "USE_CUDA_GRAPHと動的id依存copyの整合。host-weight MUL_MAT_ID経路自体がgraph無効化している可能性(ggml-cuda.cu:3260-3268)、無効ならside-stream単純化だがgraph無効分decode遅化、有効ならcapture外copyのfork/joinが要る。増分1冒頭でLOG確定。",
+   "53GB host-pinned確保がRLIMIT_MEMLOCK/driver pinned cap/断片化で失敗→pageable fallback。pageableはcudaMemcpyAsyncを同期化しoverlapを不可視に潰す(byte一致のまま遅化)。真にpinnedか起動時assert/LOUD fail必須。",
+   "dual-GPU(増分4)でlayer単位交互でも同token内両link同時稼働はlook-ahead前提。layer内expert分割はMUL_MAT_ID split-buffer非対応(ggml-cuda.cu:2629)で不可。最悪v1は片linkのみ~33 t/s止まり。",
+   "topk_moe fusionは本案でgraph/op列を変えない(配置のみ)のでunfuse懸念は元specより小。ただしhost-weight配置がmmvq_mmid_max条件(ggml-cuda.cu:3264)に触れgraph無効化する経路は要実測。",
+   "本番GLM-5.2-UD-Q2未着。本案はtensorを割らずslab丸ごとhost/device配置で量子化byte境界(元spec最大open question=nb2 block割り)に非依存=このriskは本案で解消。残るはUD-Q2固有のVRAM収まり(非routed15+hot+KV)実機確認のみ。",
+   "増分0のhost-pinned WEIGHTS配置をllama-model.cpp buft選択でどう注入するか(create_tensor内buft決定経路)は未読。-ot/-ncmoeが既にtensor単位でhost/deviceを振る実装があるはずで、それをexpert overflowへ適用する経路を増分0着手時に確認(-ncmoe=arg.cpp:2314近傍+llama-model.cpp buft override)。"
+  ]
+ }
+}

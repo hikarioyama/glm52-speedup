@@ -1,0 +1,31 @@
+# manual orchestration de-risk (manual_moe_overlap.cpp) — 2026年  6月 19日 金曜日 15:46:13 JST
+# faithful: expert=11.53MB, 22 offloaded layers, distinct per-layer data (cold RAM),
+# CPU=compute-bound dequant (g_ops=6 calibrated to real 26 t/s), GPU=real PCIe copy+sync.
+# orchestration = 1 cudaStreamSynchronize per layer (vs sched ~280/token).
+
+## RESULT (g_ops=6, CPU-only=24.5 t/s ~= real baseline):
+--- k_cpu=3 ---
+CPU-only (8 experts/layer) :   37.743 ms/token  (= 26.49 tok/s)
+GPU-branch alone           :   27.286 ms/token  (= 36.65 tok/s)
+CPU-branch alone           :   14.279 ms/token  (= 70.03 tok/s)
+MANUAL SPLIT (overlap)     :   27.179 ms/token  (= 36.79 tok/s)
+split overlap eff = 101% (100=27.286ms ideal, 0=41.564ms serial; got 27.179)
+>>> SPEEDUP vs CPU-only = 1.39x  (26.5 -> 36.8 tok/s)
+--- k_cpu=4 ---
+CPU-only (8 experts/layer) :   38.349 ms/token  (= 26.08 tok/s)
+GPU-branch alone           :   22.599 ms/token  (= 44.25 tok/s)
+CPU-branch alone           :   19.270 ms/token  (= 51.90 tok/s)
+MANUAL SPLIT (overlap)     :   23.450 ms/token  (= 42.64 tok/s)
+split overlap eff = 96% (100=22.599ms ideal, 0=41.868ms serial; got 23.450)
+>>> SPEEDUP vs CPU-only = 1.64x  (26.1 -> 42.6 tok/s)
+--- k_cpu=5 ---
+CPU-only (8 experts/layer) :   36.848 ms/token  (= 27.14 tok/s)
+GPU-branch alone           :   17.821 ms/token  (= 56.11 tok/s)
+CPU-branch alone           :   23.817 ms/token  (= 41.99 tok/s)
+MANUAL SPLIT (overlap)     :   23.950 ms/token  (= 41.75 tok/s)
+split overlap eff = 99% (100=23.817ms ideal, 0=41.639ms serial; got 23.950)
+>>> SPEEDUP vs CPU-only = 1.54x  (27.1 -> 41.8 tok/s)
+
+## VERDICT: manual orchestration overlap eff ~100%, SPEEDUP 1.7-1.9x (=> ~43 t/s).
+## The 2x win IS physical. Blocker = ggml sched does ~280 sync/token (vs 22 ideal).
+## Path: cut sched cross-backend syncs (events w/o n_copies>1 buffer blowup).

@@ -1,0 +1,9 @@
+llama.cpp master (834a243)。ggml/src/ggml-backend.cpp:1576-1678 に MoE で「host にある expert weight のうち、その token で使う expert だけを device にコピーしてから計算する」経路があると指摘された。これを精査してほしい(read-only)。
+
+具体的に答えて(file:line根拠つき):
+Q5-1: この used-expert copy 経路(1576-1678)は正確に何の関数で、どういう条件で発火するか? trigger は (a)src0 weight が特定 buffer type にある (b)op が MUL_MAT_ID (c)ある backend に op が割当たった時の copy 処理、のどれ? ggml_backend_sched の split/copy ロジックとの関係。
+Q5-2: 現状 `-ot "blk...exps=CPU"` で expert を CPU buffer に置いた場合、decode 時この経路は通るのか、それとも純粋に CPU backend が mul_mat_id を計算するだけか? つまり今の 26 t/s は「CPU計算」か「GPUへused-expert copyして計算」か、どちら?
+Q5-3: もし「expert weight を CUDA backend が使う pinned host buffer に置き、op は CUDA に割当て、used-expert だけ async copy して GPU計算」を**今のmasterのフラグ/buffer type だけで**発火させられるなら、その具体的 -ot 指定 or 必要な最小コード変更は? それとも capability 判定(ggml-cuda.cu:5421 CUDA_Host非対応)で必ず弾かれて、最小でも supports_buft 改造が要るか?
+Q5-4: この経路の overlap 特性 — copy と compute は別streamで重なるか、それとも同期copyか? 1549-1678 を読んで。
+
+簡潔に、各Q file:line で。

@@ -1,0 +1,27 @@
+# §9.1 RESOLVED — ggml sched CPU∥GPU expert-split overlap recipe — 2026年  6月 19日 金曜日 14:44:26 JST
+# spikes: sched_overlap.cpp (independent=97%), sched_overlap2.cpp (shared-input+join)
+# manual_overlap.cpp (backend-direct independent = 108%, proves foundation)
+
+## KEY: the serializer is the JOIN. sched groups the final add into the CPU split;
+## the add's GPU partial input forces synchronize(GPU) at that CPU split's start
+## => CPU branch waits for GPU branch. FIX = pin the join to backend_gpu (separate split).
+## ALSO need: pre-stage inp->CPU as an early split (cont pinned CPU, expanded first).
+
+## CPU-dominant (real MoE shape: depth_g=4 GPU, depth_c=18 CPU):
+gpu_only               :    0.864 ms/iter  (splits=1)
+cpu_only               :   22.345 ms/iter  (splits=2)
+both_NO_prestage       :   22.809 ms/iter  (splits=2)
+both_PRESTAGE          :   23.003 ms/iter  (splits=4)
+both_PRESTAGE_NOJOIN   :   22.271 ms/iter  (splits=4)
+both_PRESTAGE_JOIN_GPUPIN :   22.376 ms/iter  (splits=5)
+no-prestage     overlap =   46.3%  (22.809 ms)
+prestage        overlap =   23.8%  (23.003 ms)
+prestage_nojoin overlap =  108.6%  (22.271 ms)
+prestage_join_gpupin    =   96.4%  (22.376 ms)  <== the real-MoE shape
+
+## balanced (depth_g=30, depth_c=12):
+both_PRESTAGE_JOIN_GPUPIN :   14.977 ms/iter  (splits=5)
+prestage_join_gpupin    =   99.7%  (14.977 ms)  <== the real-MoE shape
+
+## VERDICT: with recipe (slice ids + prestage inp + pin CPU branch + pin join to GPU),
+## overlap = 86% (CPU-dominant) .. 99.7% (balanced). §9.1 GREEN. Real impl greenlit.

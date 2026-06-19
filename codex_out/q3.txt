@@ -1,0 +1,3 @@
+llama.cpp master、CUDA backend。decode は per-token グラフ + CUDA graph capture(ggml-cuda.cu の graph capture, GGML_CUDA_USE_GRAPHS)。
+attention 計算中に、その token の routed cold expert 重みを host→VRAM staging へ async H2D(別stream)で prefetch して転送を隠したい。
+Q: routing依存(動的)な cudaMemcpyAsync をグラフ実行に注入すると CUDA graph capture が壊れるか? llama.cpp の graph 再利用条件(ggml_backend_cuda_graph 周り)を読んで、(1)graph無効化した場合の launch overhead 実害 (2)graph維持したまま別streamイベントで overlapする回避策、どちらが現実的か。file:line 根拠つき簡潔に。

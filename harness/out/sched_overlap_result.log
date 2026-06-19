@@ -1,0 +1,19 @@
+# §9.1 scheduler CPU∥GPU overlap de-risk — 2026年  6月 19日 金曜日 14:26:44 JST
+# spike: harness/sched_overlap.cpp (two independent matmul chains, GPU-first split order)
+## GPU-dominant (depth19 Ng16384 Nc4096):
+gpu_only   :   13.165 ms/iter   (splits=1)
+cpu_only   :    5.306 ms/iter   (splits=1)
+both       :   13.504 ms/iter   (splits=2)
+serial(sum)   =   18.472 ms
+ideal(max)    =   13.165 ms
+measured both =   13.504 ms
+overlap_frac  =   93.6%  (100%=perfect parallel, 0%=fully serial)
+## CPU-dominant = real MoE case (depth19 Ng6144 Nc12288):
+gpu_only   :    1.835 ms/iter   (splits=1)
+cpu_only   :   47.634 ms/iter   (splits=1)
+both       :   47.677 ms/iter   (splits=2)
+serial(sum)   =   49.469 ms
+ideal(max)    =   47.634 ms
+measured both =   47.677 ms
+overlap_frac  =   97.6%  (100%=perfect parallel, 0%=fully serial)
+## VERDICT: overlap ~97% in all configs. wall=max(CPU,GPU) NOT sum. §9.1 GREEN.

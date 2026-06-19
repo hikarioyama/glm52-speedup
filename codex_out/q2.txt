@@ -1,0 +1,3 @@
+llama.cpp master で 256-expert MoE の per-expert hot/cold split を実装する。各 blk.N.ffn_{gate,up,down}_exps.weight を hot(208)/cold(48) に分け別 buffer 配置 + build_moe_ffn(llama-graph.cpp:1310)で2本の mul_mat_id 分岐。
+方式比較: (a)GGUF前処理で物理2分割しrouter id permute (b)loaderでin-memory分割。
+mul_mat_id(ggml.c:3277, expert次元=src0の3次元目)の連続性制約、ggml_mul_mat_id が要求する src0 レイアウト、top_k(llama-graph.cpp:1458)出力 selected_experts の id 値をどう hot/cold 2系統に remap するか(id<208→hot, else→cold-208)を踏まえ、実装量と正しさで推奨を。file:line 根拠つき簡潔に。

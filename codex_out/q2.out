@@ -1,0 +1,2608 @@
+Reading additional input from stdin...
+OpenAI Codex v0.140.0
+--------
+workdir: /home/hikari/src/llama.cpp
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019edb8d-2dcb-7453-9046-bc92339431fc
+--------
+user
+llama.cpp master で 256-expert MoE の per-expert hot/cold split を実装する。各 blk.N.ffn_{gate,up,down}_exps.weight を hot(208)/cold(48) に分け別 buffer 配置 + build_moe_ffn(llama-graph.cpp:1310)で2本の mul_mat_id 分岐。
+方式比較: (a)GGUF前処理で物理2分割しrouter id permute (b)loaderでin-memory分割。
+mul_mat_id(ggml.c:3277, expert次元=src0の3次元目)の連続性制約、ggml_mul_mat_id が要求する src0 レイアウト、top_k(llama-graph.cpp:1458)出力 selected_experts の id 値をどう hot/cold 2系統に remap するか(id<208→hot, else→cold-208)を踏まえ、実装量と正しさで推奨を。file:line 根拠つき簡潔に。
+codex
+該当箇所の実装前提をローカルの `master` から確認します。特に `mul_mat_id` の shape/stride 前提、MoE グラフ構築、`top_k` の expert ID の流れを見ます。
+exec
+/usr/bin/bash -lc 'rg -n "build_moe_ffn|mul_mat_id|selected_experts|top_k|ffn_.*_exps" llama-graph.cpp ggml/src/ggml.c ggml/src/ggml*.c ggml/include/ggml.h' in /home/hikari/src/llama.cpp
+ exited 2 in 0ms:
+rg: llama-graph.cpp: No such file or directory (os error 2)
+ggml/include/ggml.h:1434:    GGML_API struct ggml_tensor * ggml_mul_mat_id(
+ggml/include/ggml.h:2368:    // similar to ggml_top_k but implemented as `argsort` + `view`
+ggml/include/ggml.h:2369:    GGML_API struct ggml_tensor * ggml_argsort_top_k(
+ggml/include/ggml.h:2376:    GGML_API struct ggml_tensor * ggml_top_k(
+ggml/src/ggml.c:1158:    "top_k(x)",
+ggml/src/ggml.c:3277:// ggml_mul_mat_id
+ggml/src/ggml.c:3280:    c = ggml_mul_mat_id(ctx, as, b, ids);
+ggml/src/ggml.c:3291:struct ggml_tensor * ggml_mul_mat_id(
+ggml/src/ggml.c:5271:// ggml_argsort_top_k
+ggml/src/ggml.c:5273:struct ggml_tensor * ggml_argsort_top_k(
+ggml/src/ggml.c:5289:// ggml_top_k
+ggml/src/ggml.c:5291:struct ggml_tensor * ggml_top_k(
+ggml/src/ggml.c:1158:    "top_k(x)",
+ggml/src/ggml.c:3277:// ggml_mul_mat_id
+ggml/src/ggml.c:3280:    c = ggml_mul_mat_id(ctx, as, b, ids);
+ggml/src/ggml.c:3291:struct ggml_tensor * ggml_mul_mat_id(
+ggml/src/ggml.c:5271:// ggml_argsort_top_k
+ggml/src/ggml.c:5273:struct ggml_tensor * ggml_argsort_top_k(
+ggml/src/ggml.c:5289:// ggml_top_k
+ggml/src/ggml.c:5291:struct ggml_tensor * ggml_top_k(
+
+exec
+/usr/bin/bash -lc 'git rev-parse --abbrev-ref HEAD && git rev-parse HEAD' in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+master
+834a243664114487f99520370a7a7b00fc7a486f
+
+exec
+/usr/bin/bash -lc 'git status --short --branch' in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+## master...origin/master
+ M tools/cli/cli.cpp
+
+codex
+`llama-graph.cpp` はこの checkout では `src/` 配下です。作業木には未関係そうな `tools/cli/cli.cpp` の変更がありますが、読み取りだけで進めます。
+exec
+/usr/bin/bash -lc "nl -ba src/llama-graph.cpp | sed -n '1260,1515p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1260	                cb(cur, "ffn_sqr(relu)", il);
+  1261	            } break;
+  1262	        case LLM_FFN_SWIGLU:
+  1263	            {
+  1264	                cur = ggml_swiglu(ctx0, cur);
+  1265	                cb(cur, "ffn_swiglu", il);
+  1266	            } break;
+  1267	        case LLM_FFN_GEGLU:
+  1268	            {
+  1269	                cur = ggml_geglu(ctx0, cur);
+  1270	                cb(cur, "ffn_geglu", il);
+  1271	            } break;
+  1272	        case LLM_FFN_REGLU:
+  1273	            {
+  1274	                cur = ggml_reglu(ctx0, cur);
+  1275	                cb(cur, "ffn_reglu", il);
+  1276	            } break;
+  1277	        default:
+  1278	            GGML_ABORT("fatal error");
+  1279	    }
+  1280	
+  1281	    if (gate && type_gate == LLM_FFN_PAR) {
+  1282	        cur = ggml_mul(ctx0, cur, tmp);
+  1283	        cb(cur, "ffn_gate_par", il);
+  1284	    }
+  1285	
+  1286	    if (down) {
+  1287	        cur = build_lora_mm(down, cur);
+  1288	        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+  1289	            // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
+  1290	            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+  1291	        }
+  1292	    }
+  1293	
+  1294	    if (down_b) {
+  1295	        cb(cur, "ffn_down", il);
+  1296	    }
+  1297	
+  1298	    if (down_b) {
+  1299	        cur = ggml_add(ctx0, cur, down_b);
+  1300	    }
+  1301	
+  1302	    if (down_s) {
+  1303	        cur = ggml_mul(ctx0, cur, down_s);
+  1304	        cb(cur, "ffn_down_s", il);
+  1305	    }
+  1306	
+  1307	    return cur;
+  1308	}
+  1309	
+  1310	ggml_tensor * llm_graph_context::build_moe_ffn(
+  1311	         ggml_tensor * cur,
+  1312	         ggml_tensor * gate_inp,
+  1313	         ggml_tensor * up_exps,
+  1314	         ggml_tensor * gate_exps,
+  1315	         ggml_tensor * down_exps,
+  1316	         ggml_tensor * exp_probs_b,
+  1317	             int64_t   n_expert,
+  1318	             int64_t   n_expert_used,
+  1319	     llm_ffn_op_type   type_op,
+  1320	                bool   norm_w,
+  1321	               float   w_scale,
+  1322	         llama_expert_gating_func_type gating_op,
+  1323	                 int   il,
+  1324	         ggml_tensor * probs_in,
+  1325	         ggml_tensor * gate_up_exps,
+  1326	         ggml_tensor * up_exps_s,
+  1327	         ggml_tensor * gate_exps_s,
+  1328	         ggml_tensor * down_exps_s) const {
+  1329	    return build_moe_ffn(
+  1330	        cur,
+  1331	        gate_inp,  /* gate_inp_b  */ nullptr,
+  1332	        up_exps,   /* up_exps_b   */ nullptr,
+  1333	        gate_exps, /* gate_exps_b */ nullptr,
+  1334	        down_exps, /* down_exps_b */ nullptr,
+  1335	        exp_probs_b,
+  1336	        n_expert,
+  1337	        n_expert_used,
+  1338	        type_op,
+  1339	        norm_w,
+  1340	        w_scale,
+  1341	        gating_op,
+  1342	        il,
+  1343	        probs_in,
+  1344	        gate_up_exps,
+  1345	        /* gate_up_exps_b */ nullptr,
+  1346	        up_exps_s,
+  1347	        gate_exps_s,
+  1348	        down_exps_s
+  1349	    );
+  1350	}
+  1351	
+  1352	ggml_tensor * llm_graph_context::build_moe_ffn(
+  1353	         ggml_tensor * cur,
+  1354	         ggml_tensor * gate_inp,
+  1355	         ggml_tensor * gate_inp_b,
+  1356	         ggml_tensor * up_exps,
+  1357	         ggml_tensor * up_exps_b,
+  1358	         ggml_tensor * gate_exps,
+  1359	         ggml_tensor * gate_exps_b,
+  1360	         ggml_tensor * down_exps,
+  1361	         ggml_tensor * down_exps_b,
+  1362	         ggml_tensor * exp_probs_b,
+  1363	             int64_t   n_expert,
+  1364	             int64_t   n_expert_used,
+  1365	     llm_ffn_op_type   type_op,
+  1366	                bool   norm_w,
+  1367	               float   w_scale,
+  1368	        llama_expert_gating_func_type gating_op,
+  1369	                 int   il,
+  1370	         ggml_tensor * probs_in,
+  1371	         ggml_tensor * gate_up_exps,
+  1372	         ggml_tensor * gate_up_exps_b,
+  1373	         ggml_tensor * up_exps_s,
+  1374	         ggml_tensor * gate_exps_s,
+  1375	         ggml_tensor * down_exps_s) const {
+  1376	    const int64_t n_embd   = cur->ne[0];
+  1377	    const int64_t n_tokens = cur->ne[1];
+  1378	    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+  1379	
+  1380	    ggml_tensor * logits = nullptr;
+  1381	
+  1382	    if (probs_in == nullptr) {
+  1383	        logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+  1384	        cb(logits, "ffn_moe_logits", il);
+  1385	    } else {
+  1386	        logits = probs_in;
+  1387	    }
+  1388	
+  1389	    if (gate_inp_b) {
+  1390	        logits = ggml_add(ctx0, logits, gate_inp_b);
+  1391	        cb(logits, "ffn_moe_logits_biased", il);
+  1392	    }
+  1393	
+  1394	    ggml_tensor * probs = nullptr;
+  1395	    switch (gating_op) {
+  1396	        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+  1397	            {
+  1398	                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
+  1399	            } break;
+  1400	        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+  1401	            {
+  1402	                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+  1403	            } break;
+  1404	        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+  1405	            {
+  1406	                probs = logits; // [n_expert, n_tokens]
+  1407	            } break;
+  1408	        default:
+  1409	            GGML_ABORT("fatal error");
+  1410	    }
+  1411	    cb(probs, "ffn_moe_probs", il);
+  1412	
+  1413	    // add experts selection bias - introduced in DeepSeek V3
+  1414	    // leave probs unbiased as it's later used to get expert weights
+  1415	    ggml_tensor * selection_probs = probs;
+  1416	    if (exp_probs_b != nullptr) {
+  1417	        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+  1418	        cb(selection_probs, "ffn_moe_probs_biased", il);
+  1419	    }
+  1420	
+  1421	    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
+  1422	    // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
+  1423	    if (arch == LLM_ARCH_LLAMA4) {
+  1424	        selection_probs = logits;
+  1425	    }
+  1426	
+  1427	    if (arch == LLM_ARCH_GROVEMOE) {
+  1428	        selection_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+  1429	        cb(selection_probs, "ffn_moe_probs_biased", il);
+  1430	    }
+  1431	
+  1432	    // select top n_group_used expert groups
+  1433	    // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+  1434	    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+  1435	        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
+  1436	
+  1437	        // organize experts into n_expert_groups
+  1438	        ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
+  1439	
+  1440	        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
+  1441	        group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores); // [1, 2, n_expert_groups, n_tokens]
+  1442	
+  1443	        // get top n_group_used expert groups
+  1444	        group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
+  1445	        group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
+  1446	
+  1447	        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
+  1448	        cb(expert_groups, "ffn_moe_group_topk", il);
+  1449	
+  1450	        // mask out the other groups
+  1451	        selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
+  1452	        selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
+  1453	        selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
+  1454	        cb(selection_probs, "ffn_moe_probs_masked", il);
+  1455	    }
+  1456	
+  1457	    // select experts
+  1458	    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+  1459	    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+  1460	    cb(selected_experts, "ffn_moe_topk", il);
+  1461	
+  1462	    if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
+  1463	        // TODO: Use scalar div instead when/if implemented
+  1464	        ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+  1465	        selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
+  1466	        probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
+  1467	    } else {
+  1468	        probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+  1469	    }
+  1470	
+  1471	    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+  1472	    cb(weights, "ffn_moe_weights", il);
+  1473	
+  1474	
+  1475	    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+  1476	        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+  1477	        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
+  1478	        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+  1479	        cb(weights, "ffn_moe_weights_softmax", il);
+  1480	    }
+  1481	
+  1482	    if (norm_w) {
+  1483	        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+  1484	
+  1485	        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+  1486	        cb(weights_sum, "ffn_moe_weights_sum", il);
+  1487	
+  1488	        // Avoid division by zero, clamp to smallest number representable by F16
+  1489	        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+  1490	        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+  1491	
+  1492	        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+  1493	        cb(weights, "ffn_moe_weights_norm", il);
+  1494	
+  1495	        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+  1496	    }
+  1497	    if (w_scale != 0.0f && w_scale != 1.0f) {
+  1498	        weights = ggml_scale(ctx0, weights, w_scale);
+  1499	        cb(weights, "ffn_moe_weights_scaled", il);
+  1500	    }
+  1501	
+  1502	    //call early so that topk-moe can be used
+  1503	    ggml_build_forward_expand(gf, weights);
+  1504	
+  1505	    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+  1506	
+  1507	    if (weight_before_ffn) {
+  1508	        // repeat cur to [n_embd, n_expert_used, n_tokens]
+  1509	        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+  1510	        cur = ggml_mul(ctx0, repeated, weights);
+  1511	        cb(cur, "ffn_moe_weighted", il);
+  1512	    }
+  1513	
+  1514	    ggml_tensor * up = nullptr;
+  1515	    ggml_tensor * experts = nullptr;
+
+exec
+/usr/bin/bash -lc 'rg -n "build_moe_ffn|mul_mat_id|selected_experts|top_k|ffn_.*_exps" src/llama-graph.cpp ggml/src/ggml.c ggml/include/ggml.h src/llama-model*.cpp src/llama-model*.h src/llama-tensor*.cpp src/llama-tensor*.h' in /home/hikari/src/llama.cpp
+ exited 2 in 0ms:
+rg: src/llama-tensor*.cpp: No such file or directory (os error 2)
+rg: src/llama-tensor*.h: No such file or directory (os error 2)
+src/llama-model.h:275:    struct ggml_tensor * ffn_norm_exps    = nullptr;
+src/llama-model.h:289:    struct ggml_tensor * ffn_gate_exps     = nullptr;
+src/llama-model.h:290:    struct ggml_tensor * ffn_down_exps     = nullptr;
+src/llama-model.h:291:    struct ggml_tensor * ffn_up_exps       = nullptr;
+src/llama-model.h:292:    struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+src/llama-model.h:294:    struct ggml_tensor * ffn_gate_exps_b   = nullptr;
+src/llama-model.h:295:    struct ggml_tensor * ffn_down_exps_b   = nullptr;
+src/llama-model.h:296:    struct ggml_tensor * ffn_up_exps_b     = nullptr;
+src/llama-model.h:297:    struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+src/llama-model.h:300:    struct ggml_tensor * ffn_gate_exps_s   = nullptr;
+src/llama-model.h:301:    struct ggml_tensor * ffn_down_exps_s   = nullptr;
+src/llama-model.h:302:    struct ggml_tensor * ffn_up_exps_s     = nullptr;
+src/llama-model.h:428:    struct ggml_tensor * ffn_gate_exps_in_s = nullptr;
+src/llama-model.h:429:    struct ggml_tensor * ffn_down_exps_in_s = nullptr;
+src/llama-model.h:430:    struct ggml_tensor * ffn_up_exps_in_s   = nullptr;
+src/llama-model.cpp:344:    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
+src/llama-model.cpp:345:    const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
+src/llama-model.cpp:346:    const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+src/llama-model.cpp:347:    const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+src/llama-model.cpp:349:    const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+src/llama-model.cpp:454:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:457:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:460:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:463:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:468:        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+src/llama-model.cpp:1314:            if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
+src/llama-model.cpp:1315:                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1317:            if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
+src/llama-model.cpp:1318:                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1320:            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+src/llama-model.cpp:1321:                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1366:            if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
+src/llama-model.cpp:1367:                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1369:            if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
+src/llama-model.cpp:1370:                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1372:            if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
+src/llama-model.cpp:1373:                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2356:        case LLAMA_MODEL_META_KEY_SAMPLING_TOP_K:           return "general.sampling.top_k";
+src/llama-model.cpp:2492:    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2493:    if (layer.ffn_gate_up_exps == nullptr) {
+src/llama-model.cpp:2494:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/llama-model.cpp:2495:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/llama-model-saver.cpp:280:    add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);
+src/llama-model-loader.cpp:930:                op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+src/llama-graph.cpp:1009:    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+src/llama-graph.cpp:1020:        ggml_tensor * ab_cur = ggml_mul_mat_id(
+src/llama-graph.cpp:1022:                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+src/llama-graph.cpp:1310:ggml_tensor * llm_graph_context::build_moe_ffn(
+src/llama-graph.cpp:1329:    return build_moe_ffn(
+src/llama-graph.cpp:1352:ggml_tensor * llm_graph_context::build_moe_ffn(
+src/llama-graph.cpp:1421:    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
+src/llama-graph.cpp:1440:        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
+src/llama-graph.cpp:1447:        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
+src/llama-graph.cpp:1458:    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+src/llama-graph.cpp:1459:    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+src/llama-graph.cpp:1460:    cb(selected_experts, "ffn_moe_topk", il);
+src/llama-graph.cpp:1464:        ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+src/llama-graph.cpp:1465:        selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
+src/llama-graph.cpp:1471:    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+src/llama-graph.cpp:1518:        // merged gate_up path: one mul_mat_id, then split into gate and up views
+src/llama-graph.cpp:1519:        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+src/llama-graph.cpp:1523:            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+src/llama-graph.cpp:1531:            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+src/llama-graph.cpp:1543:        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+src/llama-graph.cpp:1547:            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+src/llama-graph.cpp:1555:            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+src/llama-graph.cpp:1561:            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+src/llama-graph.cpp:1568:            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+src/llama-graph.cpp:1576:            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+src/llama-graph.cpp:1651:    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+src/llama-graph.cpp:1655:        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+src/llama-graph.cpp:1663:        s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+ggml/src/ggml.c:1158:    "top_k(x)",
+ggml/src/ggml.c:3277:// ggml_mul_mat_id
+ggml/src/ggml.c:3280:    c = ggml_mul_mat_id(ctx, as, b, ids);
+ggml/src/ggml.c:3291:struct ggml_tensor * ggml_mul_mat_id(
+ggml/src/ggml.c:5271:// ggml_argsort_top_k
+ggml/src/ggml.c:5273:struct ggml_tensor * ggml_argsort_top_k(
+ggml/src/ggml.c:5289:// ggml_top_k
+ggml/src/ggml.c:5291:struct ggml_tensor * ggml_top_k(
+ggml/include/ggml.h:1434:    GGML_API struct ggml_tensor * ggml_mul_mat_id(
+ggml/include/ggml.h:2368:    // similar to ggml_top_k but implemented as `argsort` + `view`
+ggml/include/ggml.h:2369:    GGML_API struct ggml_tensor * ggml_argsort_top_k(
+ggml/include/ggml.h:2376:    GGML_API struct ggml_tensor * ggml_top_k(
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml.c | sed -n '3270,3345p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  3270	    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+  3271	
+  3272	    const int32_t hint_i32 = (int32_t) hint;
+  3273	
+  3274	    ggml_set_op_params_i32(a, 1, hint_i32);
+  3275	}
+  3276	
+  3277	// ggml_mul_mat_id
+  3278	
+  3279	/*
+  3280	    c = ggml_mul_mat_id(ctx, as, b, ids);
+  3281	
+  3282	    as  -> [cols, rows, n_expert]
+  3283	    b   -> [cols, n_expert_used, n_tokens]
+  3284	    ids -> [n_expert_used, n_tokens] (i32)
+  3285	    c   -> [rows, n_expert_used, n_tokens]
+  3286	
+  3287	    in b, n_expert_used can be broadcasted to match the n_expert_used of ids
+  3288	
+  3289	    c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
+  3290	*/
+  3291	struct ggml_tensor * ggml_mul_mat_id(
+  3292	        struct ggml_context * ctx,
+  3293	        struct ggml_tensor  * as,
+  3294	        struct ggml_tensor  * b,
+  3295	        struct ggml_tensor  * ids) {
+  3296	    GGML_ASSERT(!ggml_is_transposed(as));
+  3297	    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+  3298	
+  3299	    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+  3300	    GGML_ASSERT(b->ne[3] == 1); // b is 3d
+  3301	    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+  3302	    GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
+  3303	    GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
+  3304	    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+  3305	
+  3306	    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
+  3307	    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+  3308	
+  3309	    result->op     = GGML_OP_MUL_MAT_ID;
+  3310	    result->src[0] = as;
+  3311	    result->src[1] = b;
+  3312	    result->src[2] = ids;
+  3313	
+  3314	    return result;
+  3315	}
+  3316	
+  3317	// ggml_out_prod
+  3318	
+  3319	static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+  3320	    static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
+  3321	
+  3322	    return (t0->ne[1] == t1->ne[1])   &&
+  3323	           (t1->ne[2]%t0->ne[2] == 0) && // verify t0 is broadcastable
+  3324	           (t1->ne[3]%t0->ne[3] == 0);
+  3325	}
+  3326	
+  3327	struct ggml_tensor * ggml_out_prod(
+  3328	        struct ggml_context * ctx,
+  3329	        struct ggml_tensor  * a,
+  3330	        struct ggml_tensor  * b) {
+  3331	    GGML_ASSERT(ggml_can_out_prod(a, b));
+  3332	    GGML_ASSERT(!ggml_is_transposed(a));
+  3333	
+  3334	    // a is broadcastable to b for ne[2] and ne[3] -> use b->ne[2] and b->ne[3]
+  3335	    const int64_t ne[4] = { a->ne[0], b->ne[0], b->ne[2], b->ne[3] };
+  3336	    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+  3337	
+  3338	    result->op     = GGML_OP_OUT_PROD;
+  3339	    result->src[0] = a;
+  3340	    result->src[1] = b;
+  3341	
+  3342	    return result;
+  3343	}
+  3344	
+  3345	// ggml_scale
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/include/ggml.h | sed -n '1425,1445p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1425	            struct ggml_tensor * a,
+  1426	            enum ggml_prec       prec);
+  1427	
+  1428	    // change the hint of a matrix multiplication
+  1429	    GGML_API void ggml_mul_mat_set_hint(
+  1430	            struct ggml_tensor * a,
+  1431	            enum ggml_op_hint    hint);
+  1432	
+  1433	    // indirect matrix multiplication
+  1434	    GGML_API struct ggml_tensor * ggml_mul_mat_id(
+  1435	            struct ggml_context * ctx,
+  1436	            struct ggml_tensor  * as,
+  1437	            struct ggml_tensor  * b,
+  1438	            struct ggml_tensor  * ids);
+  1439	
+  1440	    // A: m columns, n rows,
+  1441	    // B: p columns, n rows,
+  1442	    // result is m columns, p rows
+  1443	    GGML_API struct ggml_tensor * ggml_out_prod(
+  1444	            struct ggml_context * ctx,
+  1445	            struct ggml_tensor  * a,
+
+codex
+MoE 側では `selected_experts` が重み取得と3本の expert 行列選択に同じ ID として使われています。次に、テンソル生成/loader と backend 側の `MUL_MAT_ID` 制約まで確認して、方式ごとの破綻点を切り分けます。
+exec
+/usr/bin/bash -lc "nl -ba src/llama-graph.cpp | sed -n '1514,1685p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1514	    ggml_tensor * up = nullptr;
+  1515	    ggml_tensor * experts = nullptr;
+  1516	
+  1517	    if (gate_up_exps) {
+  1518	        // merged gate_up path: one mul_mat_id, then split into gate and up views
+  1519	        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+  1520	        cb(gate_up, "ffn_moe_gate_up", il);
+  1521	
+  1522	        if (gate_up_exps_b) {
+  1523	            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+  1524	            cb(gate_up, "ffn_moe_gate_up_biased", il);
+  1525	        }
+  1526	
+  1527	        // apply per-expert scale2 to merged gate_up (use up_exps_s since gate and up are fused)
+  1528	        if (up_exps_s) {
+  1529	            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+  1530	            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+  1531	            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+  1532	            gate_up = ggml_mul(ctx0, gate_up, s);
+  1533	            cb(gate_up, "ffn_moe_gate_up_scaled", il);
+  1534	        }
+  1535	
+  1536	        const int64_t n_ff = gate_up->ne[0] / 2;
+  1537	        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+  1538	        cb(cur, "ffn_moe_gate", il);
+  1539	        up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+  1540	        cb(up, "ffn_moe_up", il);
+  1541	    } else {
+  1542	        // separate gate and up path
+  1543	        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+  1544	        cb(up, "ffn_moe_up", il);
+  1545	
+  1546	        if (up_exps_b) {
+  1547	            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+  1548	            cb(up, "ffn_moe_up_biased", il);
+  1549	        }
+  1550	
+  1551	        // apply per-expert scale2 to up
+  1552	        if (up_exps_s) {
+  1553	            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+  1554	            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+  1555	            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+  1556	            up = ggml_mul(ctx0, up, s);
+  1557	            cb(up, "ffn_moe_up_scaled", il);
+  1558	        }
+  1559	
+  1560	        if (gate_exps) {
+  1561	            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+  1562	            cb(cur, "ffn_moe_gate", il);
+  1563	        } else {
+  1564	            cur = up;
+  1565	        }
+  1566	
+  1567	        if (gate_exps_b) {
+  1568	            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+  1569	            cb(cur, "ffn_moe_gate_biased", il);
+  1570	        }
+  1571	
+  1572	        // apply per-expert scale2 to gate
+  1573	        if (gate_exps_s) {
+  1574	            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
+  1575	            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+  1576	            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+  1577	            cur = ggml_mul(ctx0, cur, s);
+  1578	            cb(cur, "ffn_moe_gate_scaled", il);
+  1579	        }
+  1580	    }
+  1581	
+  1582	    const bool has_gate = gate_exps || gate_up_exps;
+  1583	
+  1584	    switch (type_op) {
+  1585	        case LLM_FFN_SILU:
+  1586	            if (gate_exps) {
+  1587	                // Step35: per-layer clamp for routed experts
+  1588	                if (arch == LLM_ARCH_STEP35 && il >= 0) {
+  1589	                    const float limit = hparams.swiglu_clamp_exp[il];
+  1590	                    constexpr float eps = 1e-6f;
+  1591	                    if (limit > eps) {
+  1592	                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+  1593	                        cb(gate_act, "ffn_moe_silu", il);
+  1594	                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+  1595	                        cb(gate_act, "ffn_moe_silu_clamped", il);
+  1596	
+  1597	                        up = ggml_clamp(ctx0, up, -limit, limit);
+  1598	                        cb(up, "ffn_moe_up_clamped", il);
+  1599	
+  1600	                        cur = ggml_mul(ctx0, gate_act, up);
+  1601	                        cb(cur, "ffn_moe_swiglu_limited", il);
+  1602	                        break;
+  1603	                    }
+  1604	                }
+  1605	            }
+  1606	
+  1607	            if (has_gate) {
+  1608	                cur = ggml_swiglu_split(ctx0, cur, up);
+  1609	                cb(cur, "ffn_moe_swiglu", il);
+  1610	            } else {
+  1611	                cur = ggml_silu(ctx0, cur);
+  1612	                cb(cur, "ffn_moe_silu", il);
+  1613	            } break;
+  1614	        case LLM_FFN_GELU:
+  1615	            if (has_gate) {
+  1616	                cur = ggml_geglu_split(ctx0, cur, up);
+  1617	                cb(cur, "ffn_moe_geglu", il);
+  1618	            } else {
+  1619	                cur = ggml_gelu(ctx0, cur);
+  1620	                cb(cur, "ffn_moe_gelu", il);
+  1621	            } break;
+  1622	        case LLM_FFN_SWIGLU_OAI_MOE:
+  1623	            {
+  1624	                // TODO: move to hparams?
+  1625	                constexpr float alpha = 1.702f;
+  1626	                constexpr float limit = 7.0f;
+  1627	                cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
+  1628	                cb(cur, "ffn_moe_swiglu_oai", il);
+  1629	            } break;
+  1630	        case LLM_FFN_RELU:
+  1631	            if (has_gate) {
+  1632	                cur = ggml_reglu_split(ctx0, cur, up);
+  1633	                cb(cur, "ffn_moe_reglu", il);
+  1634	            } else {
+  1635	                cur = ggml_relu(ctx0, cur);
+  1636	                cb(cur, "ffn_moe_relu", il);
+  1637	            } break;
+  1638	        case LLM_FFN_RELU_SQR:
+  1639	            if (has_gate) {
+  1640	                // TODO: add support for gated squared relu
+  1641	                GGML_ABORT("fatal error: gated squared relu not implemented");
+  1642	            } else {
+  1643	                cur = ggml_relu(ctx0, cur);
+  1644	                cur = ggml_sqr(ctx0, cur);
+  1645	                cb(cur, "ffn_moe_relu_sqr", il);
+  1646	            } break;
+  1647	        default:
+  1648	            GGML_ABORT("fatal error");
+  1649	    }
+  1650	
+  1651	    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+  1652	    cb(experts, "ffn_moe_down", il);
+  1653	
+  1654	    if (down_exps_b) {
+  1655	        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+  1656	        cb(experts, "ffn_moe_down_biased", il);
+  1657	    }
+  1658	
+  1659	    // apply per-expert scale2 to down
+  1660	    if (down_exps_s) {
+  1661	        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
+  1662	        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+  1663	        s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
+  1664	        experts = ggml_mul(ctx0, experts, s);
+  1665	        cb(experts, "ffn_moe_down_scaled", il);
+  1666	    }
+  1667	
+  1668	    if (!weight_before_ffn) {
+  1669	        experts = ggml_mul(ctx0, experts, weights);
+  1670	        cb(experts, "ffn_moe_weighted", il);
+  1671	    }
+  1672	
+  1673	    ggml_build_forward_expand(gf, experts);
+  1674	
+  1675	    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+  1676	
+  1677	    assert(n_expert_used > 0);
+  1678	
+  1679	    // order the views before the adds
+  1680	    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+  1681	        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+  1682	
+  1683	        ggml_build_forward_expand(gf, cur_experts[i]);
+  1684	    }
+  1685	
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model-loader.cpp | sed -n '900,945p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   900	    ggml_init_params params = {
+   901	        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+   902	        /*.mem_buffer =*/ NULL,
+   903	        /*.no_alloc   =*/ true,
+   904	    };
+   905	    ggml_context_ptr ctx_ptr { ggml_init(params) };
+   906	    if (!ctx_ptr) {
+   907	        throw std::runtime_error(format("failed to create ggml context"));
+   908	    }
+   909	    ggml_context * ctx = ctx_ptr.get();
+   910	
+   911	    ggml_tensor * op_tensor = nullptr;
+   912	
+   913	    switch (op) {
+   914	        case GGML_OP_GET_ROWS:
+   915	            {
+   916	                ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+   917	                op_tensor = ggml_get_rows(ctx, w, b);
+   918	            } break;
+   919	        case GGML_OP_MUL_MAT:
+   920	            {
+   921	                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
+   922	                op_tensor = ggml_mul_mat(ctx, w, b);
+   923	            } break;
+   924	        case GGML_OP_MUL_MAT_ID:
+   925	            {
+   926	                const int n_expert_used = hparams.n_expert_used;
+   927	                GGML_ASSERT(n_expert_used > 0);
+   928	                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_expert_used, 512);
+   929	                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+   930	                op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+   931	            } break;
+   932	        case GGML_OP_ADD:
+   933	            {
+   934	                ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
+   935	                op_tensor = ggml_add(ctx, a, w);
+   936	            } break;
+   937	        case GGML_OP_ADD_ID:
+   938	            {
+   939	                const int n_expert_used = hparams.n_expert_used;
+   940	                GGML_ASSERT(n_expert_used > 0);
+   941	                ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_expert_used, 512);
+   942	                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+   943	                op_tensor = ggml_add_id(ctx, a, w, c);
+   944	            } break;
+   945	        case GGML_OP_MUL:
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model.cpp | sed -n '2480,2505p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  2480	llama_model_base::llama_model_base(const struct llama_model_params & params) : llama_model(params), model(this), tn(model->arch),
+  2481	    TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
+  2482	    TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
+  2483	    TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
+  2484	    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+  2485	
+  2486	ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+  2487	    GGML_ASSERT(ml != nullptr);
+  2488	    return create_tensor(*ml, tn, ne, flags);
+  2489	}
+  2490	
+  2491	void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+  2492	    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+  2493	    if (layer.ffn_gate_up_exps == nullptr) {
+  2494	        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+  2495	        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+  2496	    }
+  2497	}
+  2498	
+  2499	void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+  2500	        int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
+  2501	        int flags) {
+  2502	    const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
+  2503	    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+  2504	    if (layer.wqkv) {
+  2505	        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+
+exec
+/usr/bin/bash -lc 'rg -n "MUL_MAT_ID|mul_mat_id" ggml/src src | head -n 200' in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+ggml/src/ggml.c:1008:    "MUL_MAT_ID",
+ggml/src/ggml.c:3277:// ggml_mul_mat_id
+ggml/src/ggml.c:3280:    c = ggml_mul_mat_id(ctx, as, b, ids);
+ggml/src/ggml.c:3291:struct ggml_tensor * ggml_mul_mat_id(
+ggml/src/ggml.c:3309:    result->op     = GGML_OP_MUL_MAT_ID;
+src/llama-model-loader.cpp:924:        case GGML_OP_MUL_MAT_ID:
+src/llama-model-loader.cpp:930:                op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+src/llama-model-loader.cpp:1116:            if (info.op == GGML_OP_MUL_MAT_ID) {
+ggml/src/ggml-backend-meta.cpp:846:            case GGML_OP_MUL_MAT_ID: {
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:199:static void ggml_zendnn_compute_forward_mul_mat_id(
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:386:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:387:                ggml_zendnn_compute_forward_mul_mat_id(ctx, node);
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:540:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:566:            // MUL_MAT_ID performs best with a moderate number of experts due to its
+ggml/src/ggml-zendnn/ggml-zendnn.cpp:570:            if (op->op == GGML_OP_MUL_MAT_ID) {
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1530:static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1546:    webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_id_vec_pipeline(shader_lib_ctx);
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1588:static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1595:        return ggml_webgpu_mul_mat_id_vec(ctx, src0, src1, src2, dst);
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1611:    gather_pipeline = ctx->shader_lib->get_mul_mat_id_gather_pipeline(shader_lib_ctx);
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1612:    main_pipeline   = ctx->shader_lib->get_mul_mat_id_pipeline(shader_lib_ctx);
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1618:    // params for mul_mat_id_gather.wgsl
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1643:    // bind group entries for mul_mat_id_gather.wgsl
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1665:    // params for mul_mat_id.wgsl
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:1682:    // bind group entries for mul_mat_id.wgsl
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:2964:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:2965:            return ggml_webgpu_mul_mat_id(ctx, src0, src1, src2, node);
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:3583:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-webgpu/ggml-webgpu.cpp:4043:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/ggml-cpu.c:1445:// ggml_compute_forward_mul_mat_id
+ggml/src/ggml-cpu/ggml-cpu.c:1454:static void ggml_compute_forward_mul_mat_id_one_chunk(
+ggml/src/ggml-cpu/ggml-cpu.c:1525:static void ggml_compute_forward_mul_mat_id(
+ggml/src/ggml-cpu/ggml-cpu.c:1685:            ggml_compute_forward_mul_mat_id_one_chunk(
+ggml/src/ggml-cpu/ggml-cpu.c:1831:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/ggml-cpu.c:1833:                ggml_compute_forward_mul_mat_id(params, tensor);
+ggml/src/ggml-cpu/ggml-cpu.c:2299:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/ggml-cpu.c:2822:                case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/repack.cpp:4168:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/repack.cpp:4194:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/repack.cpp:4195:                forward_mul_mat_id(params, op);
+ggml/src/ggml-cpu/repack.cpp:4386:    void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
+ggml/src/ggml-cpu/repack.cpp:4791:        } else if (op->op == GGML_OP_MUL_MAT_ID
+ggml/src/ggml-cpu/repack.cpp:4811:        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_decls.tmpl:45:#ifndef MUL_MAT_ID
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:940:/** MUL_MAT_ID **/
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:942:struct ggml_webgpu_mul_mat_id_pipeline_key {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:948:    bool operator==(const ggml_webgpu_mul_mat_id_pipeline_key & other) const {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:954:struct ggml_webgpu_mul_mat_id_pipeline_key_hash {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:955:    size_t operator()(const ggml_webgpu_mul_mat_id_pipeline_key & key) const {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:1110:    std::unordered_map<int, webgpu_pipeline> mul_mat_id_gather_pipelines;  // key is fixed
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:1111:    std::unordered_map<ggml_webgpu_mul_mat_id_pipeline_key, webgpu_pipeline, ggml_webgpu_mul_mat_id_pipeline_key_hash>
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:1112:        mul_mat_id_pipelines;                                              // src0_type/src1_type
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:1113:    std::unordered_map<ggml_webgpu_mul_mat_id_pipeline_key, webgpu_pipeline, ggml_webgpu_mul_mat_id_pipeline_key_hash>
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:1114:        mul_mat_id_vec_pipelines;                                          // src0_type/src1_type
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2115:    webgpu_pipeline get_mul_mat_id_gather_pipeline(const ggml_webgpu_shader_lib_context & context) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2116:        auto it = mul_mat_id_gather_pipelines.find(1);
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2117:        if (it != mul_mat_id_gather_pipelines.end()) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2123:        auto processed     = preprocessor.preprocess(wgsl_mul_mat_id_gather, defines);
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2127:        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, "mul_mat_id_gather");
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2129:        mul_mat_id_gather_pipelines[1] = pipeline;
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2133:    webgpu_pipeline get_mul_mat_id_pipeline(const ggml_webgpu_shader_lib_context & context) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2134:        ggml_webgpu_mul_mat_id_pipeline_key key = {};
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2143:        auto it = mul_mat_id_pipelines.find(key);
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2144:        if (it != mul_mat_id_pipelines.end()) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2149:        std::string              variant = "mul_mat_id";
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2150:        defines.push_back("MUL_MAT_ID");
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2222:        // mul_mat_id is register-tile only.
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2240:        auto processed = preprocessor.preprocess(wgsl_mul_mat_id, defines);
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2252:        mul_mat_id_pipelines[key] = pipeline;
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2253:        return mul_mat_id_pipelines[key];
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2256:    webgpu_pipeline get_mul_mat_id_vec_pipeline(const ggml_webgpu_shader_lib_context & context) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2257:        ggml_webgpu_mul_mat_id_pipeline_key key = {};
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2266:        auto it = mul_mat_id_vec_pipelines.find(key);
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2267:        if (it != mul_mat_id_vec_pipelines.end()) {
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2272:        std::string              variant    = "mul_mat_id_vec";
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2273:        const char *             shader_src = wgsl_mul_mat_id_vec;
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2372:        mul_mat_id_vec_pipelines[key] = pipeline;
+ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp:2373:        return mul_mat_id_vec_pipelines[key];
+ggml/src/ggml-backend.cpp:1581:                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+ggml/src/ggml-backend.cpp:1585:                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+ggml/src/ggml-backend.cpp:1586:                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ggml/src/ggml-cann/aclnn_ops.cpp:3571:static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ggml/src/ggml-cann/aclnn_ops.cpp:3625: * This function implements MUL_MAT_ID operation for quantized weight matrices
+ggml/src/ggml-cann/aclnn_ops.cpp:3648:static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ggml/src/ggml-cann/aclnn_ops.cpp:3673:                                   (GGML_ABORT("MUL_MAT_ID only supports Q4_0 and Q8_0"), 0.0f);
+ggml/src/ggml-cann/aclnn_ops.cpp:3841:void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ggml/src/ggml-cann/aclnn_ops.cpp:3846:            ggml_cann_mul_mat_id_fp(ctx, dst);
+ggml/src/ggml-cann/aclnn_ops.cpp:3850:            ggml_cann_mul_mat_id_quant(ctx, dst);
+ggml/src/ggml-cann/aclnn_ops.cpp:3853:            GGML_ABORT("Unsupported type for mul_mat_id");
+ggml/src/ggml-cann/ggml-cann.cpp:1918:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cann/ggml-cann.cpp:1919:            ggml_cann_mul_mat_id(ctx, dst);
+ggml/src/ggml-cann/ggml-cann.cpp:2457:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cann/aclnn_ops.h:960:void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+ggml/src/ggml-cpu/spacemit/ime.cpp:151:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/spacemit/ime.cpp:208:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/spacemit/ime.cpp:220:                        forward_mul_mat_id(params, op);
+ggml/src/ggml-cpu/spacemit/ime.cpp:223:                        // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT_ID");
+ggml/src/ggml-cpu/spacemit/ime.cpp:543:    void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
+ggml/src/ggml-cpu/spacemit/ime.cpp:1594:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-cpu/spacemit/ime.cpp:1616:            case GGML_OP_MUL_MAT_ID:
+src/llama-graph.cpp:1009:    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+src/llama-graph.cpp:1020:        ggml_tensor * ab_cur = ggml_mul_mat_id(
+src/llama-graph.cpp:1022:                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+src/llama-graph.cpp:1518:        // merged gate_up path: one mul_mat_id, then split into gate and up views
+ggml/src/ggml-sycl/ggml-sycl.cpp:3978:static bool ggml_sycl_mul_mat_id_mmvq_fused(
+ggml/src/ggml-sycl/ggml-sycl.cpp:4022:static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+ggml/src/ggml-sycl/ggml-sycl.cpp:4027:    GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
+ggml/src/ggml-sycl/ggml-sycl.cpp:4038:        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+ggml/src/ggml-sycl/ggml-sycl.cpp:4460:            /* ggml_sycl_mul_mat_id is dependent on ggml_sycl_mul_mat */
+ggml/src/ggml-sycl/ggml-sycl.cpp:4463:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-sycl/ggml-sycl.cpp:4467:            ggml_sycl_mul_mat_id(ctx, dst);
+ggml/src/ggml-sycl/ggml-sycl.cpp:4775:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-sycl/ggml-sycl.cpp:4776:                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
+ggml/src/ggml-sycl/ggml-sycl.cpp:5049:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-sycl/ggml-sycl.cpp:5328:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:439:        base_dict["MUL_MAT_ID"] = "1";
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:442:        base_dict["MUL_MAT_ID"] = "1";
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:443:        base_dict["MUL_MAT_ID_USE_SUBGROUPS"] = "1";
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:681:        string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:682:        string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:683:        string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:692:            string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:693:            string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:694:            string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+src/llama-arch.cpp:705:    {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:706:    {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:707:    {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:708:    {LLM_TENSOR_FFN_GATE_UP_EXPS,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:709:    {LLM_TENSOR_FFN_DOWN_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:710:    {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:711:    {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:13:#if defined(MUL_MAT_ID_USE_SUBGROUPS)
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:18:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:36:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:54:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:86:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:112:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:122:#ifndef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:159:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:160:#ifdef MUL_MAT_ID_USE_SUBGROUPS
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:186:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:195:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:201:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:228:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:280:#ifndef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:290:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:295:#endif // MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:298:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp:306:#endif // MUL_MAT_ID
+ggml/src/ggml-opencl/ggml-opencl.cpp:4691:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-opencl/ggml-opencl.cpp:4699:            // q4_0, q8_0 and mxfp4 have general MUL_MAT_ID support,
+ggml/src/ggml-opencl/ggml-opencl.cpp:13705:static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+ggml/src/ggml-opencl/ggml-opencl.cpp:13856:                    // Otherwise reuse the reordered result from previous mul_mat_id call.
+ggml/src/ggml-opencl/ggml-opencl.cpp:14073:                    // Otherwise reuse the reordered result from previous mul_mat_id call.
+ggml/src/ggml-opencl/ggml-opencl.cpp:14249:                    // Otherwise reuse the reordered result from previous mul_mat_id call.
+ggml/src/ggml-opencl/ggml-opencl.cpp:14425:                    // Otherwise reuse the reordered result from previous mul_mat_id call.
+ggml/src/ggml-opencl/ggml-opencl.cpp:14677:                    // Otherwise reuse the reordered result from previous mul_mat_id call.
+ggml/src/ggml-opencl/ggml-opencl.cpp:16287:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-opencl/ggml-opencl.cpp:16291:            func = ggml_cl_mul_mat_id;
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl:1:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl:5:#ifdef MUL_MAT_ID_USE_SUBGROUPS
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl:73:#endif // MUL_MAT_ID_USE_SUBGROUPS
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl:74:#endif // MUL_MAT_ID
+ggml/src/ggml-metal/ggml-metal-common.cpp:262:            case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl:32:#ifdef MUL_MAT_ID
+ggml/src/ggml-metal/ggml-metal.cpp:218:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-metal/ggml-metal.cpp:220:                res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
+ggml/src/ggml-metal/ggml-metal.cpp:221:                res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
+ggml/src/ggml-metal/ggml-metal.cpp:750:        case GGML_OP_MUL_MAT_ID:
+ggml/src/ggml-metal/ggml-metal.cpp:761:            op->op == GGML_OP_MUL_MAT_ID) &&
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:22:#if defined(COOPMAT) || defined(MUL_MAT_ID_USE_SUBGROUPS)
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:27:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:69:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:87:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:143:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:153:#ifndef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:204:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:205:#ifdef MUL_MAT_ID_USE_SUBGROUPS
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:231:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:240:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:246:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:280:#if !defined(MUL_MAT_ID)
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:370:#ifndef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:375:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:428:#endif // MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:436:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:441:#endif // MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:444:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp:458:#endif // MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:50:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:95:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:203:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:221:#ifndef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:237:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:248:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:256:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:302:#if !defined(MUL_MAT_ID)
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:465:#endif // !defined(MUL_MAT_ID)
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:480:#ifdef MUL_MAT_ID
+ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp:588:#ifdef MUL_MAT_ID
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model-loader.cpp | sed -n '1085,1135p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1085	
+  1086	        // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
+  1087	        // the tensor is duplicated
+  1088	        // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
+  1089	        llm_tensor tn_tensor = tn.tensor;
+  1090	        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+  1091	            tn_tensor = LLM_TENSOR_OUTPUT;
+  1092	        }
+  1093	
+  1094	        llm_tensor_info info;
+  1095	        try {
+  1096	            info = llm_tensor_info_for(tn_tensor);
+  1097	        } catch (const std::out_of_range & e) {
+  1098	            throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
+  1099	        }
+  1100	
+  1101	        // skip unused tensors
+  1102	        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+  1103	            const size_t nbytes = ggml_nbytes(t_meta);
+  1104	            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+  1105	
+  1106	            size_data -= nbytes;
+  1107	            n_created++;
+  1108	
+  1109	            return nullptr;
+  1110	        }
+  1111	
+  1112	        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID
+  1113	        ggml_op op;
+  1114	        bool bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
+  1115	        if (bias) {
+  1116	            if (info.op == GGML_OP_MUL_MAT_ID) {
+  1117	                op = GGML_OP_ADD_ID;
+  1118	            } else {
+  1119	                op = GGML_OP_ADD;
+  1120	            }
+  1121	        } else {
+  1122	            op = info.op;
+  1123	        }
+  1124	
+  1125	        // sanity checks
+  1126	        if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
+  1127	            if (tn.bid != -1) {
+  1128	                GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
+  1129	            }
+  1130	        } else {
+  1131	            if (tn.bid == -1) {
+  1132	                GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
+  1133	            }
+  1134	        }
+  1135	
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-arch.cpp | sed -n '690,715p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   690	    {LLM_TENSOR_ATTN_Q_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   691	    {LLM_TENSOR_ATTN_K_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   692	    {LLM_TENSOR_LAYER_OUT_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   693	    {LLM_TENSOR_LAYER_OUT_SCALE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   694	    {LLM_TENSOR_ATTN_Q_A_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   695	    {LLM_TENSOR_ATTN_KV_A_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   696	    {LLM_TENSOR_ATTN_SUB_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   697	    {LLM_TENSOR_FFN_SUB_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   698	    {LLM_TENSOR_DEC_ATTN_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   699	    {LLM_TENSOR_DEC_CROSS_ATTN_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   700	    {LLM_TENSOR_DEC_FFN_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   701	    {LLM_TENSOR_ENC_ATTN_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   702	    {LLM_TENSOR_ENC_FFN_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+   703	    {LLM_TENSOR_DEC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+   704	    {LLM_TENSOR_ENC_ATTN_REL_B,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+   705	    {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   706	    {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   707	    {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   708	    {LLM_TENSOR_FFN_GATE_UP_EXPS,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   709	    {LLM_TENSOR_FFN_DOWN_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   710	    {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   711	    {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+   712	    {LLM_TENSOR_FFN_EXP_PROBS_B,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+   713	    // altup / laurel (gemma 3n)
+   714	    {LLM_TENSOR_PER_LAYER_TOKEN_EMBD,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+   715	    {LLM_TENSOR_PER_LAYER_MODEL_PROJ,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml-cpu/ggml-cpu.c | sed -n '1445,1538p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1445	// ggml_compute_forward_mul_mat_id
+  1446	
+  1447	#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+  1448	
+  1449	struct mmid_row_mapping {
+  1450	    int32_t i1;
+  1451	    int32_t i2;
+  1452	};
+  1453	
+  1454	static void ggml_compute_forward_mul_mat_id_one_chunk(
+  1455	    struct ggml_tensor * dst,
+  1456	    const struct ggml_tensor * src0,
+  1457	    const struct ggml_tensor * src1,
+  1458	    const struct ggml_tensor * ids,
+  1459	    const int64_t cur_a,
+  1460	    const int64_t ir0_start,
+  1461	    const int64_t ir0_end,
+  1462	    const int64_t ir1_start,
+  1463	    const int64_t ir1_end,
+  1464	    const char * src0_cur,
+  1465	    const struct mmid_row_mapping * matrix_rows,
+  1466	    const size_t row_size,
+  1467	    const bool src1_cont,
+  1468	    const void * wdata) {
+  1469	
+  1470	    GGML_TENSOR_BINARY_OP_LOCALS
+  1471	
+  1472	    const enum ggml_type type = src0->type;
+  1473	
+  1474	    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+  1475	    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+  1476	
+  1477	    const int64_t blck_0 = 16;
+  1478	    const int64_t blck_1 = 16;
+  1479	
+  1480	    float tmp[16];
+  1481	
+  1482	    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+  1483	        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+  1484	            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+  1485	                const int64_t _i12 = ir1; // logical row index for this expert
+  1486	
+  1487	                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+  1488	                const int id       = row_mapping.i1; // selected expert index
+  1489	
+  1490	                const int64_t  i11 = id % ne11;
+  1491	                const int64_t  i12 = row_mapping.i2; // row index in src1
+  1492	
+  1493	                const int64_t  i1 = id;  // selected expert index
+  1494	                const int64_t  i2 = i12; // row
+  1495	
+  1496	                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+  1497	                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+  1498	                //       the original src1 data pointer, so we should index using the indices directly
+  1499	                // TODO: this is a bit of a hack, we should probably have a better way to handle this
+  1500	                const char * src1_col = (const char *) wdata +
+  1501	                    (src1_cont || src1->type != vec_dot_type
+  1502	                    ? (i11      + i12*ne11)*row_size
+  1503	                    : (i11*nb11 + i12*nb12));
+  1504	
+  1505	                float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+  1506	
+  1507	                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+  1508	                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+  1509	                }
+  1510	
+  1511	                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+  1512	            }
+  1513	        }
+  1514	    }
+  1515	}
+  1516	
+  1517	static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+  1518	
+  1519	    void * ptr = *p;
+  1520	    ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
+  1521	    *p = (void *) ((char *) ptr + size);
+  1522	    return ptr;
+  1523	}
+  1524	
+  1525	static void ggml_compute_forward_mul_mat_id(
+  1526	        const struct ggml_compute_params * params,
+  1527	              struct ggml_tensor * dst) {
+  1528	
+  1529	    const struct ggml_tensor * src0 = dst->src[0];
+  1530	    const struct ggml_tensor * src1 = dst->src[1];
+  1531	    const struct ggml_tensor * ids = dst->src[2];
+  1532	
+  1533	    GGML_TENSOR_BINARY_OP_LOCALS
+  1534	
+  1535	    const int ith = params->ith;
+  1536	    const int nth = params->nth;
+  1537	
+  1538	    const enum ggml_type type = src0->type;
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml-backend.cpp | sed -n '1568,1595p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1568	            } else {
+  1569	                // wait for the split backend to finish using the input before overwriting it
+  1570	                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+  1571	                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+  1572	                } else {
+  1573	                    ggml_backend_synchronize(split_backend);
+  1574	                }
+  1575	
+  1576	                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+  1577	                ggml_tensor * node = split->graph.nodes[0];
+  1578	                if (split->graph.n_nodes > 0 &&
+  1579	                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+  1580	                    ggml_backend_buffer_is_host(input->buffer) && (
+  1581	                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+  1582	                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+  1583	                    )) {
+  1584	
+  1585	                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+  1586	                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+  1587	
+  1588	                    ggml_backend_synchronize(input_backend);
+  1589	
+  1590	                    // get the ids
+  1591	                    ggml_tensor * ids_tensor = node->src[2];
+  1592	                    ggml_backend_t ids_backend = split_backend;
+  1593	
+  1594	                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+  1595	                    // in that case, we use the original ids tensor
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml-backend.cpp | sed -n '1590,1645p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1590	                    // get the ids
+  1591	                    ggml_tensor * ids_tensor = node->src[2];
+  1592	                    ggml_backend_t ids_backend = split_backend;
+  1593	
+  1594	                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+  1595	                    // in that case, we use the original ids tensor
+  1596	                    for (int i = input_id + 1; i < split->n_inputs; i++) {
+  1597	                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+  1598	                            ids_tensor = split->inputs[i];
+  1599	                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+  1600	                            break;
+  1601	                        }
+  1602	                    }
+  1603	
+  1604	                    if (ids_tensor != prev_ids_tensor) {
+  1605	                        ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+  1606	                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+  1607	                        ggml_backend_synchronize(ids_backend);
+  1608	
+  1609	                        // find the used experts
+  1610	                        used_ids.clear();
+  1611	                        used_ids.resize(ggml_bitset_size(n_expert));
+  1612	                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+  1613	                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+  1614	                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+  1615	                                GGML_ASSERT(id >= 0 && id < n_expert);
+  1616	                                ggml_bitset_set(used_ids.data(), id);
+  1617	                            }
+  1618	                        }
+  1619	
+  1620	                        prev_ids_tensor = ids_tensor;
+  1621	                    }
+  1622	
+  1623	                    // group consecutive experts and copy them together
+  1624	                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+  1625	                        const size_t expert_offset = first_id * expert_size;
+  1626	                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+  1627	                        const size_t padding = std::min<size_t>(expert_size, 512);
+  1628	                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+  1629	
+  1630	                        ggml_backend_tensor_set_async(split_backend,
+  1631	                            input_cpy,
+  1632	                            (const uint8_t *)input->data + expert_offset, expert_offset,
+  1633	                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+  1634	                            // this is necessary for MMQ in the CUDA backend
+  1635	                            expert_size_copy + padding_end);
+  1636	                    };
+  1637	
+  1638	                    int id = 0;
+  1639	                    while (!ggml_bitset_get(used_ids.data(), id)) {
+  1640	                        id++;
+  1641	                    }
+  1642	                    int32_t first_id = id;
+  1643	                    int32_t last_id = first_id;
+  1644	
+  1645	                    for (++id; id < n_expert; ++id) {
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml-cpu/ggml-cpu.c | sed -n '1538,1695p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1538	    const enum ggml_type type = src0->type;
+  1539	
+  1540	    const bool src1_cont = ggml_is_contiguous(src1);
+  1541	
+  1542	    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
+  1543	    ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+  1544	
+  1545	    // we don't support permuted src0 or src1
+  1546	    GGML_ASSERT(nb00 == ggml_type_size(type));
+  1547	    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+  1548	
+  1549	    // dst cannot be transposed or permuted
+  1550	    GGML_ASSERT(nb0 == sizeof(float));
+  1551	    GGML_ASSERT(nb0 <= nb1);
+  1552	    GGML_ASSERT(nb1 <= nb2);
+  1553	    GGML_ASSERT(nb2 <= nb3);
+  1554	
+  1555	    // row groups
+  1556	    const int n_ids = ids->ne[0]; // n_expert_used
+  1557	    const int n_as  = ne02;       // n_expert
+  1558	
+  1559	    void * wdata_cur = params->wdata;
+  1560	
+  1561	    if (src1->type != vec_dot_type) {
+  1562	        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+  1563	    }
+  1564	
+  1565	    int64_t * matrix_row_counts = // [n_as]
+  1566	        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+  1567	
+  1568	    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
+  1569	        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+  1570	
+  1571	    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
+  1572	        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+  1573	
+  1574	    GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+  1575	
+  1576	    if (src1->type != vec_dot_type) {
+  1577	        char * wdata = params->wdata;
+  1578	
+  1579	        const size_t nbw0 = ggml_type_size(vec_dot_type);
+  1580	        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+  1581	        const size_t nbw2 = nbw1*ne11;
+  1582	        const size_t nbw3 = nbw2*ne12;
+  1583	
+  1584	        assert(params->wsize >= ne13*nbw3);
+  1585	        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+  1586	
+  1587	#if 0
+  1588	        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+  1589	            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
+  1590	                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+  1591	                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+  1592	                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+  1593	                               ne10);
+  1594	                }
+  1595	            }
+  1596	        }
+  1597	#else
+  1598	        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+  1599	            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+  1600	                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+  1601	                    size_t bs = ggml_blck_size(vec_dot_type);
+  1602	                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
+  1603	                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+  1604	                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+  1605	                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+  1606	                               (ne10_block_end - ne10_block_start) * bs);
+  1607	                }
+  1608	            }
+  1609	        }
+  1610	#endif
+  1611	    }
+  1612	
+  1613	    if (ith == 0) {
+  1614	        // initialize matrix_row_counts
+  1615	        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+  1616	
+  1617	        // group rows by src0 matrix
+  1618	        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+  1619	            for (int id = 0; id < n_ids; ++id) {
+  1620	                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+  1621	
+  1622	                assert(i02 >= 0 && i02 < n_as);
+  1623	
+  1624	                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+  1625	                matrix_row_counts[i02] += 1;
+  1626	            }
+  1627	        }
+  1628	    }
+  1629	
+  1630	    // reset current_chunk
+  1631	    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+  1632	        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+  1633	        *current_chunk_ctr = nth;
+  1634	    }
+  1635	
+  1636	    ggml_barrier(params->threadpool);
+  1637	
+  1638	    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+  1639	        const int64_t cne1 = matrix_row_counts[cur_a];
+  1640	
+  1641	        if (cne1 == 0) {
+  1642	            continue;
+  1643	        }
+  1644	
+  1645	        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+  1646	        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+  1647	        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+  1648	
+  1649	        const int64_t nr0 = ne01;
+  1650	        const int64_t nr1 = cne1;
+  1651	
+  1652	        int chunk_size = 16;
+  1653	        if (nr0 == 1 || nr1 == 1) {
+  1654	            chunk_size = 64;
+  1655	        }
+  1656	
+  1657	        // disable for NUMA
+  1658	        const bool disable_chunking = ggml_is_numa();
+  1659	
+  1660	        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+  1661	        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+  1662	
+  1663	        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+  1664	            nchunk0 = nr0 > nr1 ? nth : 1;
+  1665	            nchunk1 = nr0 > nr1 ? 1 : nth;
+  1666	        }
+  1667	
+  1668	        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+  1669	        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+  1670	
+  1671	        int current_chunk = ith;
+  1672	
+  1673	        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+  1674	
+  1675	        while (current_chunk < nchunk0 * nchunk1) {
+  1676	            const int64_t ith0 = current_chunk % nchunk0;
+  1677	            const int64_t ith1 = current_chunk / nchunk0;
+  1678	
+  1679	            const int64_t ir0_start = dr0 * ith0;
+  1680	            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+  1681	
+  1682	            const int64_t ir1_start = dr1 * ith1;
+  1683	            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+  1684	
+  1685	            ggml_compute_forward_mul_mat_id_one_chunk(
+  1686	                dst, src0, src1, ids, cur_a,
+  1687	                ir0_start, ir0_end, ir1_start, ir1_end,
+  1688	                src0_cur, matrix_rows, row_size, src1_cont, wdata
+  1689	            );
+  1690	
+  1691	            if (nth >= nchunk0 * nchunk1) {
+  1692	                break;
+  1693	            }
+  1694	
+  1695	            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+
+exec
+/usr/bin/bash -lc "nl -ba ggml/src/ggml-sycl/ggml-sycl.cpp | sed -n '4020,4045p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  4020	}
+  4021	
+  4022	static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+  4023	                                 ggml_tensor *dst) try {
+  4024	    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+  4025	    const ggml_tensor *src0 = dst->src[0];
+  4026	    const ggml_tensor *src1 = dst->src[1];
+  4027	    GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
+  4028	
+  4029	    const ggml_tensor *ids = dst->src[2];
+  4030	    GGML_TENSOR_BINARY_OP_LOCALS
+  4031	
+  4032	    const queue_ptr stream = ctx.stream();
+  4033	
+  4034	    const int64_t n_as = ne02;
+  4035	    const int64_t n_ids = ids->ne[0];
+  4036	
+  4037	    if (ne12 == 1) {
+  4038	        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+  4039	            return;
+  4040	        }
+  4041	    }
+  4042	
+  4043	    std::vector<char> ids_host(ggml_nbytes(ids));
+  4044	    const char * ids_dev = (const char *) ids->data;
+  4045	
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-graph.cpp | sed -n '990,1030p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   990	                ctx0, lw->b,
+   991	                ggml_mul_mat(ctx0, lw->a, cur)
+   992	                );
+   993	
+   994	        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+   995	        res = ggml_add(ctx0, res, ab_cur);
+   996	    }
+   997	
+   998	    if (w_s) {
+   999	        res = ggml_mul(ctx0, res, w_s);
+  1000	    }
+  1001	
+  1002	    return res;
+  1003	}
+  1004	
+  1005	ggml_tensor * llm_graph_context::build_lora_mm_id(
+  1006	          ggml_tensor * w,   // ggml_tensor * as
+  1007	          ggml_tensor * cur, // ggml_tensor * b
+  1008	          ggml_tensor * ids) const {
+  1009	    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+  1010	    for (const auto & lora : *loras) {
+  1011	        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+  1012	        if (lw == nullptr) {
+  1013	            continue;
+  1014	        }
+  1015	
+  1016	        const float alpha = lora.first->alpha;
+  1017	        const float rank  = (float) lw->b->ne[0];
+  1018	        const float scale = alpha ? lora.second * alpha / rank : lora.second;
+  1019	
+  1020	        ggml_tensor * ab_cur = ggml_mul_mat_id(
+  1021	                ctx0, lw->b,
+  1022	                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+  1023	                ids
+  1024	                );
+  1025	
+  1026	        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+  1027	        res = ggml_add(ctx0, res, ab_cur);
+  1028	    }
+  1029	
+  1030	    return res;
+
+codex
+`ggml_mul_mat_id` 自体は expert を `src0->ne[2]`、ID を `0..ne[2)-1` として扱うので、hot/cold を別 `src0` にすると ID 空間も別にしないと即 assert/誤参照になります。loader 経路で tensor 名と allocator の扱いも見ます。
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model.cpp | sed -n '320,475p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   320	
+   321	    const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
+   322	    const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+   323	    const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
+   324	    const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
+   325	    const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
+   326	    const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
+   327	    const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
+   328	    const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+   329	    const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
+   330	    const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
+   331	    const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
+   332	    const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+   333	
+   334	    const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
+   335	    const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
+   336	    const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
+   337	    const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
+   338	    const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
+   339	    const std::regex pattern_r_cache         ("cache_r_l\\d*");
+   340	    const std::regex pattern_s_cache         ("cache_s_l\\d*");
+   341	    const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+   342	    const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
+   343	
+   344	    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
+   345	    const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
+   346	    const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+   347	    const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+   348	    const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
+   349	    const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+   350	
+   351	    const std::regex pattern_output_weight("output\\.weight");
+   352	    const std::regex pattern_output_bias  ("output\\.bias");
+   353	
+   354	    struct tensor_config {
+   355	        ggml_backend_meta_split_axis axis;
+   356	
+   357	        const ggml_tensor * tensor_axis_0;
+   358	
+   359	        uint32_t il;
+   360	        size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+   361	    };
+   362	
+   363	    auto get_tensor_config_impl = [&](
+   364	                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
+   365	        // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
+   366	        //     count only the same type of previous layers to avoid this
+   367	        auto get_il_eff = [&](const size_t il){
+   368	            size_t ret = 0;
+   369	            const bool il_is_recurrent = hparams.is_recurrent(il);
+   370	            const bool il_is_swa       = hparams.is_swa(il);
+   371	            for (size_t il_prev = 0; il_prev < il; il_prev++) {
+   372	                ret += hparams.is_recurrent(il_prev) == il_is_recurrent && hparams.is_swa(il_prev) == il_is_swa;
+   373	            }
+   374	            return ret;
+   375	        };
+   376	
+   377	        uint32_t il;
+   378	        std::string prefix;
+   379	        size_t rotation;
+   380	        if (tensor_name.substr(0, 4) == "blk.") {
+   381	            const size_t length_prefix = tensor_name.find('.', 4);
+   382	            GGML_ASSERT(length_prefix != std::string::npos);
+   383	            prefix = tensor_name.substr(0, length_prefix + 1);
+   384	            il = std::stoull(tensor_name.substr(4, length_prefix));
+   385	            rotation = get_il_eff(il) % ud->n_devices;
+   386	        } else if (tensor_name.substr(0, 6) == "cache_") {
+   387	            const size_t layer_index_start = tensor_name.find("_l", 6);
+   388	            GGML_ASSERT(layer_index_start != std::string::npos);
+   389	            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+   390	            prefix = "blk." + std::to_string(il) + ".";
+   391	            rotation = get_il_eff(il) % ud->n_devices;
+   392	        } else {
+   393	            il = 0;
+   394	            rotation = hparams.n_layer % ud->n_devices;
+   395	        }
+   396	        const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
+   397	        if (tensor_axis_0 == nullptr) {
+   398	            GGML_ASSERT(!suffix_fallback.empty());
+   399	            tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
+   400	        }
+   401	        GGML_ASSERT(tensor_axis_0 != nullptr);
+   402	        return {axis, tensor_axis_0, il, rotation};
+   403	    };
+   404	
+   405	    auto get_tensor_config = [&]() -> tensor_config {
+   406	        // standard attention
+   407	        if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
+   408	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+   409	        }
+   410	        if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
+   411	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+   412	        }
+   413	        if (std::regex_match(tensor_name, pattern_qkv_weight)) {
+   414	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+   415	        }
+   416	        if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
+   417	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+   418	        }
+   419	        if (std::regex_match(tensor_name, pattern_qk_norm)) {
+   420	            return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+   421	        }
+   422	        if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+   423	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+   424	        }
+   425	        if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+   426	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+   427	        }
+   428	        if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
+   429	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+   430	        }
+   431	
+   432	        if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+   433	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+   434	        }
+   435	        if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
+   436	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+   437	        }
+   438	        if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
+   439	                std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
+   440	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+   441	        }
+   442	        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+   443	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+   444	        }
+   445	        if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
+   446	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+   447	        }
+   448	        if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+   449	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+   450	        }
+   451	
+   452	        // FFN
+   453	        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
+   454	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+   455	        }
+   456	        if (std::regex_match(tensor_name, pattern_ffn_up_gate_bias)) {
+   457	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+   458	        }
+   459	        if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+   460	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+   461	        }
+   462	        if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+   463	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+   464	        }
+   465	        if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
+   466	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+   467	        }
+   468	        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+   469	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
+   470	        }
+   471	
+   472	        // output
+   473	        if (std::regex_match(tensor_name, pattern_output_weight)) {
+   474	            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+   475	        }
+
+exec
+/usr/bin/bash -lc "rg -n \"create_tensor\\(|check_tensors|tensor_map|weights_map|t_meta|gguf\" src/llama-model-loader.cpp src/llama-model.cpp | head -n 220" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+src/llama-model.cpp:976:    const gguf_context * ctx = ml.metadata;
+src/llama-model.cpp:979:    for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
+src/llama-model.cpp:980:        gguf_type type = gguf_get_kv_type(ctx, i);
+src/llama-model.cpp:984:        const char * name = gguf_get_key(ctx, i);
+src/llama-model.cpp:985:        const std::string value = gguf_kv_to_str(ctx, i);
+src/llama-model.cpp:986:        gguf_kv.emplace(name, value);
+src/llama-model.cpp:1170:    this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+src/llama-model.cpp:1275:                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1278:                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1281:                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1284:                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1287:                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1290:                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1295:                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1298:                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1301:                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1304:                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1307:                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1310:                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1315:                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1318:                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1321:                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1326:                layer.ssm_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1329:                layer.ssm_out_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1332:                layer.ssm_alpha_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1335:                layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1340:                layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1343:                layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1346:                layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1349:                layer.wo_in_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1352:                layer.wqkv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1355:                layer.wqkv_gate_in_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1358:                layer.ffn_gate_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1361:                layer.ffn_down_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1364:                layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1367:                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1370:                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1373:                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1376:                layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1379:                layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1382:                layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1385:                layer.ssm_in_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1388:                layer.ssm_out_in_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1391:                layer.ssm_alpha_in_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1394:                layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1546:ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+src/llama-model.cpp:1548:    return ml.create_tensor(
+src/llama-model.cpp:2065:    // if the gguf model was converted with --sentence-transformers-dense-modules
+src/llama-model.cpp:2096:        /*.check_tensors               =*/ false,
+src/llama-model.cpp:2339:    const auto & it = model->gguf_kv.find(key);
+src/llama-model.cpp:2340:    if (it == model->gguf_kv.end()) {
+src/llama-model.cpp:2350:    return (int)model->gguf_kv.size();
+src/llama-model.cpp:2372:    if (i < 0 || i >= (int)model->gguf_kv.size()) {
+src/llama-model.cpp:2378:    auto it = model->gguf_kv.begin();
+src/llama-model.cpp:2384:    if (i < 0 || i >= (int)model->gguf_kv.size()) {
+src/llama-model.cpp:2390:    auto it = model->gguf_kv.begin();
+src/llama-model.cpp:2406:    const auto & it = model->gguf_kv.find(key);
+src/llama-model.cpp:2407:    if (it == model->gguf_kv.end()) {
+src/llama-model.cpp:2457:const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
+src/llama-model.cpp:2486:ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+src/llama-model.cpp:2488:    return create_tensor(*ml, tn, ne, flags);
+src/llama-model.cpp:2492:    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2494:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/llama-model.cpp:2495:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/llama-model.cpp:2503:    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+src/llama-model.cpp:2505:        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+src/llama-model.cpp:2507:        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
+src/llama-model.cpp:2508:        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
+src/llama-model.cpp:2509:        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
+src/llama-model.cpp:2510:        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2511:        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2512:        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+src/llama-model-loader.cpp:5:#include "gguf.h"
+src/llama-model-loader.cpp:77:// for example, given "<name>-00002-of-00004.gguf", returns list of all 4 splits
+src/llama-model-loader.cpp:104:    template <typename T, gguf_type gt_, T (*gfun)(const gguf_context *, const int64_t)>
+src/llama-model-loader.cpp:106:        static constexpr gguf_type gt = gt_;
+src/llama-model-loader.cpp:108:        static T getter(const gguf_context * ctx, const int kid) {
+src/llama-model-loader.cpp:115:    template<> struct GKV_Base<bool        >: GKV_Base_Type<bool,         GGUF_TYPE_BOOL,    gguf_get_val_bool> {};
+src/llama-model-loader.cpp:116:    template<> struct GKV_Base<uint8_t     >: GKV_Base_Type<uint8_t,      GGUF_TYPE_UINT8,   gguf_get_val_u8  > {};
+src/llama-model-loader.cpp:117:    template<> struct GKV_Base<uint16_t    >: GKV_Base_Type<uint16_t,     GGUF_TYPE_UINT16,  gguf_get_val_u16 > {};
+src/llama-model-loader.cpp:118:    template<> struct GKV_Base<uint32_t    >: GKV_Base_Type<uint32_t,     GGUF_TYPE_UINT32,  gguf_get_val_u32 > {};
+src/llama-model-loader.cpp:119:    template<> struct GKV_Base<uint64_t    >: GKV_Base_Type<uint64_t,     GGUF_TYPE_UINT64,  gguf_get_val_u64 > {};
+src/llama-model-loader.cpp:120:    template<> struct GKV_Base<int8_t      >: GKV_Base_Type<int8_t,       GGUF_TYPE_INT8,    gguf_get_val_i8  > {};
+src/llama-model-loader.cpp:121:    template<> struct GKV_Base<int16_t     >: GKV_Base_Type<int16_t,      GGUF_TYPE_INT16,   gguf_get_val_i16 > {};
+src/llama-model-loader.cpp:122:    template<> struct GKV_Base<int32_t     >: GKV_Base_Type<int32_t,      GGUF_TYPE_INT32,   gguf_get_val_i32 > {};
+src/llama-model-loader.cpp:123:    template<> struct GKV_Base<int64_t     >: GKV_Base_Type<int64_t,      GGUF_TYPE_INT64,   gguf_get_val_i64 > {};
+src/llama-model-loader.cpp:124:    template<> struct GKV_Base<float       >: GKV_Base_Type<float,        GGUF_TYPE_FLOAT32, gguf_get_val_f32 > {};
+src/llama-model-loader.cpp:125:    template<> struct GKV_Base<double      >: GKV_Base_Type<double,       GGUF_TYPE_FLOAT64, gguf_get_val_f64 > {};
+src/llama-model-loader.cpp:126:    template<> struct GKV_Base<const char *>: GKV_Base_Type<const char *, GGUF_TYPE_STRING,  gguf_get_val_str > {};
+src/llama-model-loader.cpp:129:        static constexpr gguf_type gt = GGUF_TYPE_STRING;
+src/llama-model-loader.cpp:131:        static std::string getter(const gguf_context * ctx, const int kid) {
+src/llama-model-loader.cpp:132:            return gguf_get_val_str(ctx, kid);
+src/llama-model-loader.cpp:137:        const gguf_type gt;
+src/llama-model-loader.cpp:144:        static constexpr gguf_type gt = GGUF_TYPE_ARRAY;
+src/llama-model-loader.cpp:145:        static ArrayInfo getter(const gguf_context *ctx, const int k) {
+src/llama-model-loader.cpp:146:            const enum gguf_type arr_type = gguf_get_arr_type(ctx, k);
+src/llama-model-loader.cpp:149:                size_t(gguf_get_arr_n(ctx, k)),
+src/llama-model-loader.cpp:150:                arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx, k),
+src/llama-model-loader.cpp:160:        static T get_kv(const gguf_context * ctx, const int k) {
+src/llama-model-loader.cpp:161:            const enum gguf_type kt = gguf_get_kv_type(ctx, k);
+src/llama-model-loader.cpp:165:                    gguf_get_key(ctx, k), gguf_type_name(kt), gguf_type_name(GKV::gt)));
+src/llama-model-loader.cpp:251:        static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+src/llama-model-loader.cpp:260:        static bool set(const gguf_context * ctx, const char * key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+src/llama-model-loader.cpp:261:            return set(ctx, gguf_find_key(ctx, key), target, ovrd);
+src/llama-model-loader.cpp:264:        static bool set(const gguf_context * ctx, const std::string & key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+src/llama-model-loader.cpp:273:        const int kid = gguf_find_key(metadata, key.c_str());
+src/llama-model-loader.cpp:300:        const gguf_context * ctx = metadata;
+src/llama-model-loader.cpp:301:        const int kid = gguf_find_key(ctx, key.c_str());
+src/llama-model-loader.cpp:303:        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+src/llama-model-loader.cpp:324:            const size_t n_items = gguf_get_arr_n(ctx, kid);
+src/llama-model-loader.cpp:328:                const T value = gguf_get_arr_str(ctx, kid, i);
+src/llama-model-loader.cpp:341:        const gguf_context * ctx = metadata;
+src/llama-model-loader.cpp:342:        const int kid = gguf_find_key(ctx, key.c_str());
+src/llama-model-loader.cpp:344:        if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+src/llama-model-loader.cpp:370:            const size_t n_items = gguf_get_arr_n(ctx, kid);
+src/llama-model-loader.cpp:373:                const T value = gguf_get_arr_str(ctx, kid, i);
+src/llama-model-loader.cpp:438:        const int kid = gguf_find_key(metadata, key.c_str());
+src/llama-model-loader.cpp:451:        if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
+src/llama-model-loader.cpp:484:        const int id = gguf_find_key(metadata, key.c_str());
+src/llama-model-loader.cpp:494:        if (gguf_get_kv_type(metadata, id) == GGUF_TYPE_ARRAY) {
+src/llama-model-loader.cpp:511:        struct gguf_context * meta,
+src/llama-model-loader.cpp:519:        bool check_tensors,
+src/llama-model-loader.cpp:540:        struct gguf_init_params params = {
+src/llama-model-loader.cpp:545:        metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+src/llama-model-loader.cpp:577:            if (weights_map.find(tensor_name) != weights_map.end()) {
+src/llama-model-loader.cpp:582:            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+src/llama-model-loader.cpp:615:                struct gguf_init_params split_params = {
+src/llama-model-loader.cpp:619:                gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
+src/llama-model-loader.cpp:620:                if (!ctx_gguf) {
+src/llama-model-loader.cpp:626:                    const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
+src/llama-model-loader.cpp:630:                    int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
+src/llama-model-loader.cpp:631:                    if (idx_gguf != idx) {
+src/llama-model-loader.cpp:632:                        throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
+src/llama-model-loader.cpp:643:                    if (weights_map.find(tensor_name) != weights_map.end()) {
+src/llama-model-loader.cpp:648:                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+src/llama-model-loader.cpp:656:                const int n_tensors_loaded = (int) weights_map.size();
+src/llama-model-loader.cpp:666:        struct gguf_init_params params = {
+src/llama-model-loader.cpp:671:        metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+src/llama-model-loader.cpp:687:            if (weights_map.find(tensor_name) != weights_map.end()) {
+src/llama-model-loader.cpp:692:            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+src/llama-model-loader.cpp:699:    n_kv      = gguf_get_n_kv(metadata);
+src/llama-model-loader.cpp:700:    n_tensors = weights_map.size();
+src/llama-model-loader.cpp:702:    fver = (enum llama_fver) gguf_get_version(metadata);
+src/llama-model-loader.cpp:715:        for (const auto & it : weights_map) {
+src/llama-model-loader.cpp:783:            const char * name           = gguf_get_key(metadata, i);
+src/llama-model-loader.cpp:784:            const enum gguf_type type   = gguf_get_kv_type(metadata, i);
+src/llama-model-loader.cpp:787:                ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
+src/llama-model-loader.cpp:788:                : gguf_type_name(type);
+src/llama-model-loader.cpp:790:            std::string value          = gguf_kv_to_str(metadata, i);
+src/llama-model-loader.cpp:817:    this->check_tensors = check_tensors;
+src/llama-model-loader.cpp:830:    auto pos = weights_map.find(name);
+src/llama-model-loader.cpp:831:    if (pos != weights_map.end()) {
+src/llama-model-loader.cpp:1045:struct ggml_tensor * llama_model_loader::create_tensor(
+src/llama-model-loader.cpp:1078:    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+src/llama-model-loader.cpp:1079:        if (!t_meta) {
+src/llama-model-loader.cpp:1103:            const size_t nbytes = ggml_nbytes(t_meta);
+src/llama-model-loader.cpp:1163:                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+src/llama-model-loader.cpp:1176:                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+src/llama-model-loader.cpp:1184:            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+src/llama-model-loader.cpp:1202:                first_tensor_moved_name = t_meta->name;
+src/llama-model-loader.cpp:1203:                first_tensor_moved_type_name = ggml_type_name(t_meta->type);
+src/llama-model-loader.cpp:1218:        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+src/llama-model-loader.cpp:1220:            type = gguf_get_tensor_type(metadata, tid);
+src/llama-model-loader.cpp:1232:        ggml_tensor t_meta;
+src/llama-model-loader.cpp:1233:        memset(&t_meta, 0, sizeof(ggml_tensor));
+src/llama-model-loader.cpp:1234:        t_meta.type = type;
+src/llama-model-loader.cpp:1236:            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+src/llama-model-loader.cpp:1237:            GGML_ASSERT(t_meta.ne[dim] >= 1);
+src/llama-model-loader.cpp:1238:            t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
+src/llama-model-loader.cpp:1239:            GGML_ASSERT(t_meta.nb[dim] >= 1);
+src/llama-model-loader.cpp:1241:        ggml_set_name(&t_meta, tn.str().c_str());
+src/llama-model-loader.cpp:1243:        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+src/llama-model-loader.cpp:1246:        ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+src/llama-model-loader.cpp:1251:    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+src/llama-model-loader.cpp:1252:    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
+src/llama-model-loader.cpp:1354:    for (const auto & it : weights_map) {
+src/llama-model-loader.cpp:1394:    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+src/llama-model-loader.cpp:1434:        if (use_mmap || check_tensors) {
+src/llama-model-loader.cpp:1537:            if (check_tensors) {
+src/llama-model-loader.cpp:1563:                if (check_tensors) {
+src/llama-model-loader.cpp:1627:                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+
+exec
+/usr/bin/bash -lc 'rg -n "TENSOR_FFN_.*EXPS|ffn_.*_exps|ffn_.*_chexps|CHEXPS|_COLD|HOT" src ggml | head -n 250' in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+src/llama-model.h:275:    struct ggml_tensor * ffn_norm_exps    = nullptr;
+src/llama-model.h:289:    struct ggml_tensor * ffn_gate_exps     = nullptr;
+src/llama-model.h:290:    struct ggml_tensor * ffn_down_exps     = nullptr;
+src/llama-model.h:291:    struct ggml_tensor * ffn_up_exps       = nullptr;
+src/llama-model.h:292:    struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+src/llama-model.h:294:    struct ggml_tensor * ffn_gate_exps_b   = nullptr;
+src/llama-model.h:295:    struct ggml_tensor * ffn_down_exps_b   = nullptr;
+src/llama-model.h:296:    struct ggml_tensor * ffn_up_exps_b     = nullptr;
+src/llama-model.h:297:    struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+src/llama-model.h:300:    struct ggml_tensor * ffn_gate_exps_s   = nullptr;
+src/llama-model.h:301:    struct ggml_tensor * ffn_down_exps_s   = nullptr;
+src/llama-model.h:302:    struct ggml_tensor * ffn_up_exps_s     = nullptr;
+src/llama-model.h:315:    struct ggml_tensor * ffn_gate_chexps     = nullptr;
+src/llama-model.h:316:    struct ggml_tensor * ffn_down_chexps     = nullptr;
+src/llama-model.h:317:    struct ggml_tensor * ffn_up_chexps       = nullptr;
+src/llama-model.h:428:    struct ggml_tensor * ffn_gate_exps_in_s = nullptr;
+src/llama-model.h:429:    struct ggml_tensor * ffn_down_exps_in_s = nullptr;
+src/llama-model.h:430:    struct ggml_tensor * ffn_up_exps_in_s   = nullptr;
+src/models/mistral3.cpp:75:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/mistral3.cpp:76:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/mistral3.cpp:77:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/mistral3.cpp:195:                    model.layers[il].ffn_up_exps,
+src/models/mistral3.cpp:196:                    model.layers[il].ffn_gate_exps,
+src/models/mistral3.cpp:197:                    model.layers[il].ffn_down_exps,
+src/models/rnd1.cpp:53:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/rnd1.cpp:54:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/rnd1.cpp:55:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/rnd1.cpp:140:                    model.layers[il].ffn_up_exps,
+src/models/rnd1.cpp:141:                    model.layers[il].ffn_gate_exps,
+src/models/rnd1.cpp:142:                    model.layers[il].ffn_down_exps,
+src/models/lfm2moe.cpp:45:            layer.ffn_gate_exps   = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+src/models/lfm2moe.cpp:46:            layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp,   n_embd, n_expert}, 0);
+src/models/lfm2moe.cpp:47:            layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i),   {n_embd, hparams.n_ff_exp, n_expert}, 0);
+src/models/qwen2moe.cpp:46:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen2moe.cpp:47:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/qwen2moe.cpp:48:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen2moe.cpp:133:                    model.layers[il].ffn_up_exps,
+src/models/qwen2moe.cpp:134:                    model.layers[il].ffn_gate_exps,
+src/models/qwen2moe.cpp:135:                    model.layers[il].ffn_down_exps,
+src/models/bailingmoe.cpp:48:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/bailingmoe.cpp:49:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/bailingmoe.cpp:50:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/bailingmoe.cpp:130:                    model.layers[il].ffn_up_exps,
+src/models/bailingmoe.cpp:131:                    model.layers[il].ffn_gate_exps,
+src/models/bailingmoe.cpp:132:                    model.layers[il].ffn_down_exps,
+src/models/nemotron-h.cpp:102:                layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   moe_n_embd, n_expert}, 0);
+src/models/nemotron-h.cpp:103:                layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {moe_n_embd, n_ff_exp, n_expert}, 0);
+src/models/nemotron-h.cpp:223:                    model.layers[il].ffn_up_exps,
+src/models/nemotron-h.cpp:225:                    model.layers[il].ffn_down_exps,
+src/models/nemotron-h.cpp:233:                    model.layers[il].ffn_up_exps_s,
+src/models/nemotron-h.cpp:235:                    model.layers[il].ffn_down_exps_s);
+src/models/phimoe.cpp:39:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/phimoe.cpp:40:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
+src/models/phimoe.cpp:41:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/step35.cpp:89:        layer.ffn_gate_exps     = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
+src/models/step35.cpp:90:        layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/step35.cpp:91:        layer.ffn_up_exps       = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
+src/models/step35.cpp:226:                    model.layers[il].ffn_up_exps,
+src/models/step35.cpp:227:                    model.layers[il].ffn_gate_exps,
+src/models/step35.cpp:228:                    model.layers[il].ffn_down_exps,
+src/models/llama4.cpp:80:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+src/models/llama4.cpp:81:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff_exp, n_embd, n_expert}, 0);
+src/models/llama4.cpp:82:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+src/models/llama4.cpp:222:                    model.layers[il].ffn_up_exps,
+src/models/llama4.cpp:223:                    model.layers[il].ffn_gate_exps,
+src/models/llama4.cpp:224:                    model.layers[il].ffn_down_exps,
+src/models/qwen3vlmoe.cpp:53:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3vlmoe.cpp:54:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/qwen3vlmoe.cpp:55:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3vlmoe.cpp:146:                    model.layers[il].ffn_up_exps,
+src/models/qwen3vlmoe.cpp:147:                    model.layers[il].ffn_gate_exps,
+src/models/qwen3vlmoe.cpp:148:                    model.layers[il].ffn_down_exps,
+src/models/deepseek2.cpp:131:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/deepseek2.cpp:390:                model.layers[il].ffn_up_exps,
+src/models/deepseek2.cpp:391:                model.layers[il].ffn_gate_exps,
+src/models/deepseek2.cpp:392:                model.layers[il].ffn_down_exps,
+src/models/deepseek2.cpp:400:                model.layers[il].ffn_gate_up_exps);
+src/models/exaone-moe.cpp:88:            layer.ffn_gate_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,  "weight", i), {n_embd, n_ff_exp, n_expert}, flags);
+src/models/exaone-moe.cpp:89:            layer.ffn_down_exps  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,  "weight", i), {n_ff_exp, n_embd, n_expert}, flags);
+src/models/exaone-moe.cpp:90:            layer.ffn_up_exps    = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,    "weight", i), {n_embd, n_ff_exp, n_expert}, flags);
+src/models/exaone-moe.cpp:197:                model.layers[il].ffn_up_exps,
+src/models/exaone-moe.cpp:198:                model.layers[il].ffn_gate_exps,
+src/models/exaone-moe.cpp:199:                model.layers[il].ffn_down_exps,
+src/models/deepseek2ocr.cpp:68:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/qwen3next.cpp:95:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+src/models/qwen3next.cpp:583:                model.layers[il].ffn_up_exps,
+src/models/qwen3next.cpp:584:                model.layers[il].ffn_gate_exps,
+src/models/qwen3next.cpp:585:                model.layers[il].ffn_down_exps,
+src/models/qwen3next.cpp:591:                nullptr, model.layers[il].ffn_gate_up_exps);
+src/models/ernie4-5-moe.cpp:83:                                        model.layers[il].ffn_up_exps,
+src/models/ernie4-5-moe.cpp:84:                                        model.layers[il].ffn_gate_exps,
+src/models/ernie4-5-moe.cpp:85:                                        model.layers[il].ffn_down_exps,
+src/models/llada-moe.cpp:43:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/llada-moe.cpp:44:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/llada-moe.cpp:45:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/llada-moe.cpp:127:                model.layers[il].ffn_up_exps,
+src/models/llada-moe.cpp:128:                model.layers[il].ffn_gate_exps,
+src/models/llada-moe.cpp:129:                model.layers[il].ffn_down_exps,
+src/models/mimo2.cpp:65:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | skip);
+src/models/mimo2.cpp:66:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED | skip);
+src/models/mimo2.cpp:67:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED | skip);
+src/models/mimo2.cpp:203:                    model.layers[il].ffn_up_exps,
+src/models/mimo2.cpp:204:                    model.layers[il].ffn_gate_exps,
+src/models/mimo2.cpp:205:                    model.layers[il].ffn_down_exps,
+src/models/jina-bert-v3.cpp:47:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff,   n_expert}, 0);
+src/models/jina-bert-v3.cpp:48:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff,   n_embd, n_expert}, 0);
+src/models/dbrx.cpp:37:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/dbrx.cpp:38:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
+src/models/dbrx.cpp:39:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/dbrx.cpp:117:                model.layers[il].ffn_up_exps,
+src/models/dbrx.cpp:118:                model.layers[il].ffn_gate_exps,
+src/models/dbrx.cpp:119:                model.layers[il].ffn_down_exps,
+src/models/gemma4.cpp:113:            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/gemma4.cpp:115:            if (layer.ffn_gate_up_exps == nullptr) {
+src/models/gemma4.cpp:116:                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+src/models/gemma4.cpp:117:                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+src/models/gemma4.cpp:120:            layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+src/models/gemma4.cpp:295:                    model.layers[il].ffn_up_exps,
+src/models/gemma4.cpp:296:                    model.layers[il].ffn_gate_exps,
+src/models/gemma4.cpp:297:                    model.layers[il].ffn_down_exps,
+src/models/gemma4.cpp:304:                    model.layers[il].ffn_gate_up_exps,
+src/models/gemma4.cpp:305:                    model.layers[il].ffn_up_exps_s,
+src/models/gemma4.cpp:306:                    model.layers[il].ffn_gate_exps_s,
+src/models/gemma4.cpp:307:                    model.layers[il].ffn_down_exps_s);
+src/models/kimi-linear.cpp:152:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+src/models/kimi-linear.cpp:153:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+src/models/kimi-linear.cpp:154:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+src/models/kimi-linear.cpp:502:                layer.ffn_up_exps,
+src/models/kimi-linear.cpp:503:                layer.ffn_gate_exps,
+src/models/kimi-linear.cpp:504:                layer.ffn_down_exps,
+src/models/minimax-m2.cpp:36:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/minimax-m2.cpp:37:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
+src/models/minimax-m2.cpp:38:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
+src/models/minimax-m2.cpp:131:                model.layers[il].ffn_up_exps,
+src/models/minimax-m2.cpp:132:                model.layers[il].ffn_gate_exps,
+src/models/minimax-m2.cpp:133:                model.layers[il].ffn_down_exps,
+src/models/granite-hybrid.cpp:107:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/granite-hybrid.cpp:108:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/granite-hybrid.cpp:109:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/granite-hybrid.cpp:263:                model.layers[il].ffn_up_exps,
+src/models/granite-hybrid.cpp:264:                model.layers[il].ffn_gate_exps,
+src/models/granite-hybrid.cpp:265:                model.layers[il].ffn_down_exps,
+src/models/qwen35moe.cpp:89:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+src/models/qwen35moe.cpp:480:            model.layers[il].ffn_up_exps,
+src/models/qwen35moe.cpp:481:            model.layers[il].ffn_gate_exps,
+src/models/qwen35moe.cpp:482:            model.layers[il].ffn_down_exps,
+src/models/qwen35moe.cpp:488:            nullptr, model.layers[il].ffn_gate_up_exps,
+src/models/qwen35moe.cpp:489:            model.layers[il].ffn_up_exps_s,
+src/models/qwen35moe.cpp:490:            model.layers[il].ffn_gate_exps_s,
+src/models/qwen35moe.cpp:491:            model.layers[il].ffn_down_exps_s);
+src/models/granite-moe.cpp:72:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/granite-moe.cpp:73:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/granite-moe.cpp:74:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/openai-moe.cpp:47:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/openai-moe.cpp:48:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/openai-moe.cpp:49:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/openai-moe.cpp:54:        layer.ffn_gate_exps_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0);
+src/models/openai-moe.cpp:55:        layer.ffn_down_exps_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0);
+src/models/openai-moe.cpp:56:        layer.ffn_up_exps_b   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert}, 0);
+src/models/openai-moe.cpp:134:                model.layers[il].ffn_up_exps,   model.layers[il].ffn_up_exps_b,
+src/models/openai-moe.cpp:135:                model.layers[il].ffn_gate_exps, model.layers[il].ffn_gate_exps_b,
+src/models/openai-moe.cpp:136:                model.layers[il].ffn_down_exps, model.layers[il].ffn_down_exps_b,
+src/llama-arch.cpp:364:    { LLM_TENSOR_FFN_GATE_EXPS,                          "blk.%d.ffn_gate_exps" },
+src/llama-arch.cpp:365:    { LLM_TENSOR_FFN_GATE_UP_EXPS,                       "blk.%d.ffn_gate_up_exps" },
+src/llama-arch.cpp:366:    { LLM_TENSOR_FFN_DOWN_EXPS,                          "blk.%d.ffn_down_exps" },
+src/llama-arch.cpp:367:    { LLM_TENSOR_FFN_UP_EXPS,                            "blk.%d.ffn_up_exps" },
+src/llama-arch.cpp:445:    { LLM_TENSOR_FFN_NORM_EXPS,                          "blk.%d.ffn_norm_exps" },
+src/llama-arch.cpp:539:    { LLM_TENSOR_FFN_GATE_CHEXPS,                        "blk.%d.ffn_gate_chexps" },
+src/llama-arch.cpp:540:    { LLM_TENSOR_FFN_DOWN_CHEXPS,                        "blk.%d.ffn_down_chexps" },
+src/llama-arch.cpp:541:    { LLM_TENSOR_FFN_UP_CHEXPS,                          "blk.%d.ffn_up_chexps" },
+src/llama-arch.cpp:689:    {LLM_TENSOR_FFN_NORM_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+src/llama-arch.cpp:705:    {LLM_TENSOR_FFN_DOWN_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:706:    {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:707:    {LLM_TENSOR_FFN_UP_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:708:    {LLM_TENSOR_FFN_GATE_UP_EXPS,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:709:    {LLM_TENSOR_FFN_DOWN_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:710:    {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:711:    {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/models/minicpm.cpp:72:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/minicpm.cpp:73:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/minicpm.cpp:74:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/lfm2.cpp:49:            layer.ffn_gate_exps   = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+src/models/lfm2.cpp:50:            layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp,   n_embd, n_expert}, 0);
+src/models/lfm2.cpp:51:            layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i),   {n_embd, hparams.n_ff_exp, n_expert}, 0);
+src/models/lfm2.cpp:111:                model.layers[il].ffn_up_exps,
+src/models/lfm2.cpp:112:                model.layers[il].ffn_gate_exps,
+src/models/lfm2.cpp:113:                model.layers[il].ffn_down_exps,
+src/models/jamba.cpp:92:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff, n_expert}, 0);
+src/models/jamba.cpp:93:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff, n_embd, n_expert}, 0);
+src/models/jamba.cpp:94:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff, n_expert}, 0);
+src/models/jamba.cpp:165:                    model.layers[il].ffn_up_exps,
+src/models/jamba.cpp:166:                    model.layers[il].ffn_gate_exps,
+src/models/jamba.cpp:167:                    model.layers[il].ffn_down_exps,
+src/llama-model.cpp:344:    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
+src/llama-model.cpp:345:    const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
+src/llama-model.cpp:346:    const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+src/llama-model.cpp:347:    const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+src/llama-model.cpp:349:    const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+src/llama-model.cpp:454:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:457:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:460:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:463:            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+src/llama-model.cpp:468:        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+src/llama-model.cpp:1314:            if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
+src/llama-model.cpp:1315:                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1317:            if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
+src/llama-model.cpp:1318:                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1320:            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+src/llama-model.cpp:1321:                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1366:            if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
+src/llama-model.cpp:1367:                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1369:            if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
+src/llama-model.cpp:1370:                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1372:            if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
+src/llama-model.cpp:1373:                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2492:    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:2493:    if (layer.ffn_gate_up_exps == nullptr) {
+src/llama-model.cpp:2494:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/llama-model.cpp:2495:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+src/models/arctic.cpp:45:        layer.ffn_norm_exps = create_tensor(tn(LLM_TENSOR_FFN_NORM_EXPS, "weight", i), {n_embd}, 0);
+src/models/arctic.cpp:46:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, false);
+src/models/arctic.cpp:47:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/arctic.cpp:48:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/arctic.cpp:137:                model.layers[il].ffn_norm_exps, NULL,
+src/models/arctic.cpp:139:        cb(cur, "ffn_norm_exps", il);
+src/models/arctic.cpp:143:                model.layers[il].ffn_up_exps,
+src/models/arctic.cpp:144:                model.layers[il].ffn_gate_exps,
+src/models/arctic.cpp:145:                model.layers[il].ffn_down_exps,
+src/models/llama.cpp:80:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/llama.cpp:81:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+src/models/llama.cpp:82:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+src/models/llama.cpp:203:                    model.layers[il].ffn_up_exps,
+src/models/llama.cpp:204:                    model.layers[il].ffn_gate_exps,
+src/models/llama.cpp:205:                    model.layers[il].ffn_down_exps,
+src/models/llama.cpp:213:                    model.layers[il].ffn_up_exps_s,
+src/models/llama.cpp:214:                    model.layers[il].ffn_gate_exps_s,
+src/models/llama.cpp:215:                    model.layers[il].ffn_down_exps_s);
+src/models/qwen3moe.cpp:52:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3moe.cpp:53:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/qwen3moe.cpp:54:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3moe.cpp:137:                    model.layers[il].ffn_up_exps,
+src/models/qwen3moe.cpp:138:                    model.layers[il].ffn_gate_exps,
+src/models/qwen3moe.cpp:139:                    model.layers[il].ffn_down_exps,
+src/models/qwen3moe.cpp:147:                    model.layers[il].ffn_up_exps_s,
+src/models/qwen3moe.cpp:148:                    model.layers[il].ffn_gate_exps_s,
+src/models/qwen3moe.cpp:149:                    model.layers[il].ffn_down_exps_s);
+src/models/ernie4-5.cpp:54:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
+src/models/ernie4-5.cpp:55:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff_exp, n_embd, n_expert}, 0);
+src/models/ernie4-5.cpp:56:            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+src/models/glm-dsa.cpp:128:            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+
+codex
+既存の offload/split 配置はテンソル名と op から自動決定され、現状の `ffn_*_exps` は1テンソル1 op の前提です。hot/cold を正式 tensor として持たせるなら、tensor enum/name/op と配置規則も増やす必要があります。
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model-loader.cpp | sed -n '1045,1260p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+  1045	struct ggml_tensor * llama_model_loader::create_tensor(
+  1046	        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+  1047	        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+  1048	    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+  1049	        auto it = ctx_map.find(buft);
+  1050	        if (it == ctx_map.end()) {
+  1051	            // one ggml context per buffer type
+  1052	            int max_n_tensors = n_tensors;
+  1053	            max_n_tensors += 1;                 // duplicated output tensor
+  1054	            max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+  1055	            if (files.empty()) {
+  1056	                max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
+  1057	            }
+  1058	            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+  1059	
+  1060	            ggml_init_params params = {
+  1061	                /*.mem_size   =*/ ctx_size,
+  1062	                /*.mem_buffer =*/ NULL,
+  1063	                /*.no_alloc   =*/ true,
+  1064	            };
+  1065	
+  1066	            ggml_context * ctx = ggml_init(params);
+  1067	            if (!ctx) {
+  1068	                throw std::runtime_error(format("failed to create ggml context"));
+  1069	            }
+  1070	
+  1071	            ctx_map.emplace(buft, ctx);
+  1072	
+  1073	            return ctx;
+  1074	        }
+  1075	        return it->second.get();
+  1076	    };
+  1077	
+  1078	    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+  1079	        if (!t_meta) {
+  1080	            if (flags & TENSOR_NOT_REQUIRED) {
+  1081	                return nullptr;
+  1082	            }
+  1083	            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+  1084	        }
+  1085	
+  1086	        // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
+  1087	        // the tensor is duplicated
+  1088	        // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
+  1089	        llm_tensor tn_tensor = tn.tensor;
+  1090	        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+  1091	            tn_tensor = LLM_TENSOR_OUTPUT;
+  1092	        }
+  1093	
+  1094	        llm_tensor_info info;
+  1095	        try {
+  1096	            info = llm_tensor_info_for(tn_tensor);
+  1097	        } catch (const std::out_of_range & e) {
+  1098	            throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
+  1099	        }
+  1100	
+  1101	        // skip unused tensors
+  1102	        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+  1103	            const size_t nbytes = ggml_nbytes(t_meta);
+  1104	            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+  1105	
+  1106	            size_data -= nbytes;
+  1107	            n_created++;
+  1108	
+  1109	            return nullptr;
+  1110	        }
+  1111	
+  1112	        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID
+  1113	        ggml_op op;
+  1114	        bool bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
+  1115	        if (bias) {
+  1116	            if (info.op == GGML_OP_MUL_MAT_ID) {
+  1117	                op = GGML_OP_ADD_ID;
+  1118	            } else {
+  1119	                op = GGML_OP_ADD;
+  1120	            }
+  1121	        } else {
+  1122	            op = info.op;
+  1123	        }
+  1124	
+  1125	        // sanity checks
+  1126	        if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
+  1127	            if (tn.bid != -1) {
+  1128	                GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
+  1129	            }
+  1130	        } else {
+  1131	            if (tn.bid == -1) {
+  1132	                GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
+  1133	            }
+  1134	        }
+  1135	
+  1136	        // select the buffer type for this tensor
+  1137	        const buft_list_t * buft_list;
+  1138	        switch (info.layer) {
+  1139	            case LLM_TENSOR_LAYER_INPUT:
+  1140	                buft_list = buft_list_input;
+  1141	                break;
+  1142	            case LLM_TENSOR_LAYER_OUTPUT:
+  1143	                buft_list = buft_list_output;
+  1144	                break;
+  1145	            case LLM_TENSOR_LAYER_REPEATING:
+  1146	                GGML_ASSERT(buft_list_layer != nullptr);
+  1147	                buft_list = buft_list_layer;
+  1148	                break;
+  1149	            default:
+  1150	                GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+  1151	        }
+  1152	
+  1153	        ggml_backend_buffer_type_t buft = nullptr;
+  1154	
+  1155	        // check overrides
+  1156	        if (tensor_buft_overrides) {
+  1157	            std::string tensor_name = tn.str();
+  1158	            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+  1159	                std::regex pattern(overrides->pattern);
+  1160	                if (std::regex_search(tensor_name, pattern)) {
+  1161	                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+  1162	                        // when overriding to a CPU buffer, consider the extra buffer types
+  1163	                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+  1164	                        if (use_mmap) {
+  1165	                            static std::once_flag once;
+  1166	                            std::call_once(once, [] {
+  1167	                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n");
+  1168	                            });
+  1169	                        }
+  1170	                    } else {
+  1171	                        buft = overrides->buft;
+  1172	                    }
+  1173	
+  1174	                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
+  1175	                            tensor_name.c_str(),
+  1176	                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+  1177	                            ggml_backend_buft_name(buft));
+  1178	                    break;
+  1179	                }
+  1180	            }
+  1181	        }
+  1182	
+  1183	        if (!buft) {
+  1184	            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+  1185	            if (!buft) {
+  1186	                throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+  1187	            }
+  1188	        }
+  1189	
+  1190	        // avoid using a host buffer when using mmap
+  1191	        auto * buft_dev = ggml_backend_buft_get_device(buft);
+  1192	        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+  1193	            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+  1194	            if (!cpu_dev) {
+  1195	                throw std::runtime_error("no CPU backend found");
+  1196	            }
+  1197	            buft = ggml_backend_dev_buffer_type(cpu_dev);
+  1198	        }
+  1199	
+  1200	        if (buft != buft_list->front().second) {
+  1201	            if (n_tensors_moved == 0) {
+  1202	                first_tensor_moved_name = t_meta->name;
+  1203	                first_tensor_moved_type_name = ggml_type_name(t_meta->type);
+  1204	                first_moved_from_buft = buft_list->front().second;
+  1205	                first_moved_to_buft   = buft;
+  1206	            }
+  1207	            n_tensors_moved++;
+  1208	        }
+  1209	
+  1210	        return buft;
+  1211	    };
+  1212	
+  1213	    if (files.empty()) {
+  1214	        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
+  1215	            return nullptr;
+  1216	        }
+  1217	        ggml_type type = GGML_TYPE_F32;
+  1218	        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+  1219	        if (tid != -1) {
+  1220	            type = gguf_get_tensor_type(metadata, tid);
+  1221	        }
+  1222	
+  1223	        // for tensors that are not required some of the dimensions can be invalid:
+  1224	        if (flags & TENSOR_NOT_REQUIRED) {
+  1225	            for (size_t dim = 0; dim < ne.size(); dim++) {
+  1226	                if (ne.begin()[dim] <= 0) {
+  1227	                    return nullptr;
+  1228	                }
+  1229	            }
+  1230	        }
+  1231	
+  1232	        ggml_tensor t_meta;
+  1233	        memset(&t_meta, 0, sizeof(ggml_tensor));
+  1234	        t_meta.type = type;
+  1235	        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+  1236	            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+  1237	            GGML_ASSERT(t_meta.ne[dim] >= 1);
+  1238	            t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
+  1239	            GGML_ASSERT(t_meta.nb[dim] >= 1);
+  1240	        }
+  1241	        ggml_set_name(&t_meta, tn.str().c_str());
+  1242	
+  1243	        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+  1244	        GGML_ASSERT(buft != nullptr);
+  1245	        ggml_context * ctx = ctx_for_buft(buft);
+  1246	        ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+  1247	        ggml_set_name(ret, tn.str().c_str());
+  1248	        return ret;
+  1249	    }
+  1250	
+  1251	    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+  1252	    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
+  1253	    if (buft == nullptr) {
+  1254	        return nullptr; // return type is ggml_tensor *
+  1255	    }
+  1256	    ggml_context * ctx = ctx_for_buft(buft);
+  1257	
+  1258	    // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
+  1259	    if (flags & TENSOR_DUPLICATED) {
+  1260	        ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-model.h | sed -n '260,325p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   260	
+   261	    // relative position bias
+   262	    struct ggml_tensor * attn_rel_b       = nullptr;
+   263	    struct ggml_tensor * attn_rel_b_enc   = nullptr;
+   264	    struct ggml_tensor * attn_rel_b_cross = nullptr;
+   265	
+   266	    // normalization
+   267	    struct ggml_tensor * ffn_norm         = nullptr;
+   268	    struct ggml_tensor * ffn_norm_b       = nullptr;
+   269	    struct ggml_tensor * ffn_post_norm    = nullptr;
+   270	    struct ggml_tensor * ffn_post_norm_1  = nullptr; // gemma4
+   271	    struct ggml_tensor * ffn_post_norm_2  = nullptr; // gemma4
+   272	    struct ggml_tensor * ffn_pre_norm_2   = nullptr; // gemma4
+   273	    struct ggml_tensor * layer_out_norm   = nullptr;
+   274	    struct ggml_tensor * layer_out_norm_b = nullptr;
+   275	    struct ggml_tensor * ffn_norm_exps    = nullptr;
+   276	    struct ggml_tensor * ffn_norm_enc     = nullptr;
+   277	
+   278	    // ff
+   279	    struct ggml_tensor * ffn_gate     = nullptr; // w1
+   280	    struct ggml_tensor * ffn_down     = nullptr; // w2
+   281	    struct ggml_tensor * ffn_up       = nullptr; // w3
+   282	    struct ggml_tensor * ffn_gate_enc = nullptr;
+   283	    struct ggml_tensor * ffn_down_enc = nullptr;
+   284	    struct ggml_tensor * ffn_up_enc   = nullptr;
+   285	
+   286	    // ff MoE
+   287	    struct ggml_tensor * ffn_gate_inp      = nullptr;
+   288	    struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
+   289	    struct ggml_tensor * ffn_gate_exps     = nullptr;
+   290	    struct ggml_tensor * ffn_down_exps     = nullptr;
+   291	    struct ggml_tensor * ffn_up_exps       = nullptr;
+   292	    struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+   293	    struct ggml_tensor * ffn_gate_inp_b    = nullptr;
+   294	    struct ggml_tensor * ffn_gate_exps_b   = nullptr;
+   295	    struct ggml_tensor * ffn_down_exps_b   = nullptr;
+   296	    struct ggml_tensor * ffn_up_exps_b     = nullptr;
+   297	    struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+   298	
+   299	    // ff MoE per-expert scales (NVFP4 per-tensor scale2)
+   300	    struct ggml_tensor * ffn_gate_exps_s   = nullptr;
+   301	    struct ggml_tensor * ffn_down_exps_s   = nullptr;
+   302	    struct ggml_tensor * ffn_up_exps_s     = nullptr;
+   303	
+   304	    // ff MoE latent proj
+   305	    struct ggml_tensor * ffn_latent_down = nullptr;
+   306	    struct ggml_tensor * ffn_latent_up   = nullptr;
+   307	
+   308	    // ff shared expert (shexp)
+   309	    struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
+   310	    struct ggml_tensor * ffn_gate_shexp     = nullptr;
+   311	    struct ggml_tensor * ffn_down_shexp     = nullptr;
+   312	    struct ggml_tensor * ffn_up_shexp       = nullptr;
+   313	
+   314	    // ff adjugate experts (chexps)
+   315	    struct ggml_tensor * ffn_gate_chexps     = nullptr;
+   316	    struct ggml_tensor * ffn_down_chexps     = nullptr;
+   317	    struct ggml_tensor * ffn_up_chexps       = nullptr;
+   318	
+   319	    // ff bias
+   320	    struct ggml_tensor * ffn_gate_b = nullptr;
+   321	    struct ggml_tensor * ffn_down_b = nullptr; // b2
+   322	    struct ggml_tensor * ffn_up_b   = nullptr; // b3
+   323	    struct ggml_tensor * ffn_act    = nullptr;
+   324	    struct ggml_tensor * ffn_exp_probs_b = nullptr;
+   325	
+
+exec
+/usr/bin/bash -lc "nl -ba src/llama-arch.cpp | sed -n '355,370p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+   355	    { LLM_TENSOR_ATTN_ROT_EMBD,                          "blk.%d.attn_rot_embd" },
+   356	    { LLM_TENSOR_FFN_GATE_INP,                           "blk.%d.ffn_gate_inp" },
+   357	    { LLM_TENSOR_FFN_NORM,                               "blk.%d.ffn_norm" },
+   358	    { LLM_TENSOR_FFN_GATE,                               "blk.%d.ffn_gate" },
+   359	    { LLM_TENSOR_FFN_DOWN,                               "blk.%d.ffn_down" },
+   360	    { LLM_TENSOR_FFN_UP,                                 "blk.%d.ffn_up" },
+   361	    { LLM_TENSOR_FFN_GATE_EXP,                           "blk.%d.ffn_gate.%d" },
+   362	    { LLM_TENSOR_FFN_DOWN_EXP,                           "blk.%d.ffn_down.%d" },
+   363	    { LLM_TENSOR_FFN_UP_EXP,                             "blk.%d.ffn_up.%d" },
+   364	    { LLM_TENSOR_FFN_GATE_EXPS,                          "blk.%d.ffn_gate_exps" },
+   365	    { LLM_TENSOR_FFN_GATE_UP_EXPS,                       "blk.%d.ffn_gate_up_exps" },
+   366	    { LLM_TENSOR_FFN_DOWN_EXPS,                          "blk.%d.ffn_down_exps" },
+   367	    { LLM_TENSOR_FFN_UP_EXPS,                            "blk.%d.ffn_up_exps" },
+   368	    { LLM_TENSOR_ATTN_POST_NORM,                         "blk.%d.post_attention_norm" },
+   369	    { LLM_TENSOR_ATTN_Q_NORM,                            "blk.%d.attn_q_norm" },
+   370	    { LLM_TENSOR_ATTN_K_NORM,                            "blk.%d.attn_k_norm" },
+
+exec
+/usr/bin/bash -lc 'rg -n "enum llm_tensor|LLM_TENSOR_FFN_GATE_EXPS|LLM_TENSOR_FFN_DOWN_CHEXPS" src/llama-arch.h src/llama-arch.cpp src/llama-model.h' in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+src/llama-arch.cpp:364:    { LLM_TENSOR_FFN_GATE_EXPS,                          "blk.%d.ffn_gate_exps" },
+src/llama-arch.cpp:540:    { LLM_TENSOR_FFN_DOWN_CHEXPS,                        "blk.%d.ffn_down_chexps" },
+src/llama-arch.cpp:706:    {LLM_TENSOR_FFN_GATE_EXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.cpp:709:    {LLM_TENSOR_FFN_DOWN_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+src/llama-arch.h:349:enum llm_tensor {
+src/llama-arch.h:390:    LLM_TENSOR_FFN_GATE_EXPS,
+src/llama-arch.h:396:    LLM_TENSOR_FFN_DOWN_CHEXPS,
+src/llama-arch.h:560:enum llm_tensor_layer {
+
+exec
+/usr/bin/bash -lc "nl -ba src/models/qwen3moe.cpp | sed -n '45,60p;130,152p'" in /home/hikari/src/llama.cpp
+exec
+/usr/bin/bash -lc "nl -ba src/llama-arch.h | sed -n '382,400p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+    45	        if (n_expert_used == 0) {
+    46	            throw std::runtime_error("n_expert_used must be > 0 for QWEN3MOE");
+    47	        }
+    48	
+    49	        // MoE branch
+    50	        const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+    51	
+    52	        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+    53	        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+    54	        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+    55	    }
+    56	}
+    57	
+    58	std::unique_ptr<llm_graph_context> llama_model_qwen3moe::build_arch_graph(const llm_graph_params & params) const {
+    59	    return std::make_unique<graph>(*this, params);
+    60	}
+   130	                model.layers[il].ffn_norm, NULL,
+   131	                LLM_NORM_RMS, il);
+   132	        cb(cur, "ffn_norm", il);
+   133	
+   134	        ggml_tensor * moe_out =
+   135	            build_moe_ffn(cur,
+   136	                    model.layers[il].ffn_gate_inp,
+   137	                    model.layers[il].ffn_up_exps,
+   138	                    model.layers[il].ffn_gate_exps,
+   139	                    model.layers[il].ffn_down_exps,
+   140	                    nullptr,
+   141	                    n_expert, n_expert_used,
+   142	                    LLM_FFN_SILU, true,
+   143	                    hparams.expert_weights_scale,
+   144	                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+   145	                    il,
+   146	                    nullptr, nullptr,
+   147	                    model.layers[il].ffn_up_exps_s,
+   148	                    model.layers[il].ffn_gate_exps_s,
+   149	                    model.layers[il].ffn_down_exps_s);
+   150	        cb(moe_out, "ffn_moe_out", il);
+   151	        cur = moe_out;
+   152	
+
+ succeeded in 0ms:
+   382	    LLM_TENSOR_FFN_DOWN,
+   383	    LLM_TENSOR_FFN_UP,
+   384	    LLM_TENSOR_FFN_ACT,
+   385	    LLM_TENSOR_FFN_DOWN_EXP,  // split experts for backward compatibility
+   386	    LLM_TENSOR_FFN_GATE_EXP,
+   387	    LLM_TENSOR_FFN_UP_EXP,
+   388	    LLM_TENSOR_FFN_NORM_EXPS,
+   389	    LLM_TENSOR_FFN_DOWN_EXPS, // merged experts
+   390	    LLM_TENSOR_FFN_GATE_EXPS,
+   391	    LLM_TENSOR_FFN_UP_EXPS,
+   392	    LLM_TENSOR_FFN_GATE_UP_EXPS,
+   393	    LLM_TENSOR_FFN_DOWN_SHEXP,
+   394	    LLM_TENSOR_FFN_GATE_SHEXP,
+   395	    LLM_TENSOR_FFN_UP_SHEXP,
+   396	    LLM_TENSOR_FFN_DOWN_CHEXPS,
+   397	    LLM_TENSOR_FFN_GATE_CHEXPS,
+   398	    LLM_TENSOR_FFN_UP_CHEXPS,
+   399	    LLM_TENSOR_FFN_EXP_PROBS_B,
+   400	    LLM_TENSOR_FFN_LATENT_DOWN,
+
+exec
+/usr/bin/bash -lc "nl -ba src/models/llama.cpp | sed -n '74,84p;198,216p'" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+    74	            // optional MLP bias
+    75	            layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+    76	            layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
+    77	            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+    78	        } else {
+    79	            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
+    80	            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+    81	            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+    82	            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+    83	
+    84	            // For Granite MoE Shared
+   198	                    LLM_NORM_RMS, il);
+   199	            cb(cur, "ffn_norm", il);
+   200	
+   201	            cur = build_moe_ffn(cur,
+   202	                    model.layers[il].ffn_gate_inp,
+   203	                    model.layers[il].ffn_up_exps,
+   204	                    model.layers[il].ffn_gate_exps,
+   205	                    model.layers[il].ffn_down_exps,
+   206	                    nullptr,
+   207	                    n_expert, n_expert_used,
+   208	                    LLM_FFN_SILU, true,
+   209	                    hparams.expert_weights_scale,
+   210	                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+   211	                    il,
+   212	                    nullptr, nullptr,
+   213	                    model.layers[il].ffn_up_exps_s,
+   214	                    model.layers[il].ffn_gate_exps_s,
+   215	                    model.layers[il].ffn_down_exps_s);
+   216	            cb(cur, "ffn_moe_out", il);
+
+exec
+/usr/bin/bash -lc "rg -n \"n_expert\\b|n_expert_used|n_group_experts|n_group_used\" src/llama-hparams.* src/llama-model.cpp src/models/qwen3moe.cpp src/models/deepseek2.cpp" in /home/hikari/src/llama.cpp
+ succeeded in 0ms:
+src/models/deepseek2.cpp:120:            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+src/models/deepseek2.cpp:121:            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/models/deepseek2.cpp:123:            if (n_expert == 0) {
+src/models/deepseek2.cpp:124:                throw std::runtime_error("n_expert must be > 0");
+src/models/deepseek2.cpp:126:            if (n_expert_used == 0) {
+src/models/deepseek2.cpp:127:                throw std::runtime_error("n_expert_used must be > 0");
+src/models/deepseek2.cpp:131:            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/deepseek2.cpp:132:            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
+src/models/deepseek2.cpp:394:                n_expert, n_expert_used,
+src/models/qwen3moe.cpp:40:        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+src/models/qwen3moe.cpp:42:        if (n_expert == 0) {
+src/models/qwen3moe.cpp:43:            throw std::runtime_error("n_expert must be > 0 for QWEN3MOE");
+src/models/qwen3moe.cpp:45:        if (n_expert_used == 0) {
+src/models/qwen3moe.cpp:46:            throw std::runtime_error("n_expert_used must be > 0 for QWEN3MOE");
+src/models/qwen3moe.cpp:50:        const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+src/models/qwen3moe.cpp:52:        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3moe.cpp:53:        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+src/models/qwen3moe.cpp:54:        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+src/models/qwen3moe.cpp:141:                    n_expert, n_expert_used,
+src/llama-model.cpp:1004:    ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+src/llama-model.cpp:1005:    ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
+src/llama-model.cpp:1007:    ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
+src/llama-model.cpp:1010:        if (hparams.n_expert <= 1) {
+src/llama-model.cpp:1011:            hparams.n_expert      = 0;
+src/llama-model.cpp:1012:            hparams.n_expert_used = 0;
+src/llama-model.cpp:1027:    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
+src/llama-model.cpp:1028:    GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
+src/llama-model.cpp:1029:    if (hparams.n_expert > 0) {
+src/llama-model.cpp:1030:        GGML_ASSERT(hparams.n_expert_used > 0);
+src/llama-model.cpp:1031:        GGML_ASSERT(hparams.n_expert_groups < hparams.n_expert);
+src/llama-model.cpp:1033:            GGML_ASSERT(hparams.n_expert % hparams.n_expert_groups == 0);
+src/llama-model.cpp:1034:            GGML_ASSERT(hparams.n_group_used > 0);
+src/llama-model.cpp:1035:            GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+src/llama-model.cpp:1038:        GGML_ASSERT(hparams.n_expert_used == 0);
+src/llama-model.cpp:1256:        const int64_t n_expert      = hparams.n_expert;
+src/llama-model.cpp:1257:        const int64_t n_expert_used = hparams.n_expert_used;
+src/llama-model.cpp:1259:        if (n_expert > 0 && n_expert_used == 0) {
+src/llama-model.cpp:1313:            // MoE expert weight scales (per-expert, shape {n_expert})
+src/llama-model.cpp:1315:                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1318:                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1321:                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1367:                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1370:                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1373:                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+src/llama-model.cpp:1672:        LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
+src/llama-model.cpp:1673:        LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used);
+src/llama-model.cpp:1675:        LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
+src/llama-model.cpp:1805:            LLAMA_LOG_INFO("%s: n_group_experts       = %d\n",     __func__, hparams.n_group_experts);
+src/llama-model.cpp:2461:int32_t llama_model_n_expert(const struct llama_model * model) {
+src/llama-model.cpp:2462:    return model->hparams.n_expert;
+src/llama-hparams.h:47:    uint32_t n_expert = 0;
+src/llama-hparams.h:48:    uint32_t n_expert_used = 0;
+src/llama-hparams.h:84:    uint32_t n_group_used       = 0;
+src/llama-hparams.h:85:    uint32_t n_group_experts    = 0;
+
+codex
+推奨は **(a) GGUF 前処理で物理2分割 + router ID permute** です。実装量も正しさもこちらが堅いです。
+
+理由:
+
+- `ggml_mul_mat_id` は `src0/as = [cols, rows, n_expert]`, `ids = [n_expert_used, n_tokens]` を前提にし、ID は `0 <= id < src0->ne[2]` でなければなりません。根拠: [ggml.c:3280](/home/hikari/src/llama.cpp/ggml/src/ggml.c:3280), [ggml.c:3296](/home/hikari/src/llama.cpp/ggml/src/ggml.c:3296), [ggml-cpu.c:1620](/home/hikari/src/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1620)。
+- `selected_experts` は `top_k` の元 ID のまま、重み取得にも expert matmul にも使われています。根拠: [llama-graph.cpp:1458](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1458), [llama-graph.cpp:1471](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1471), [llama-graph.cpp:1543](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1543), [llama-graph.cpp:1561](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1561), [llama-graph.cpp:1651](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1651)。
+- loader 側は現状、GGUF tensor 名からそのまま tensor を作り、op/buffer を選びます。in-memory 分割だと virtual tensor 生成、mmap/split-file/quantized row のコピー、buffer override、tensor check をまたぐ必要があり重いです。根拠: [llama-model-loader.cpp:1078](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1078), [llama-model-loader.cpp:1183](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1183), [llama-model-loader.cpp:1251](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1251)。既存の MoE tensor は `MUL_MAT_ID` 扱いです: [llama-arch.cpp:705](/home/hikari/src/llama.cpp/src/llama-arch.cpp:705)。
+
+実装方針は、GGUF 前処理で hot expert を `0..207`、cold expert を `208..255` に並べ替え、`ffn_gate_inp` の expert 出力次元、`exp_probs_b`、per-expert scale/bias があればそれらも同じ permute/split します。runtime では global `selected_experts` は重み取得用に保持し、matmul 用にだけ:
+
+```text
+hot_ids  = id < 208 ? id       : 0
+cold_ids = id >= 208 ? id - 208 : 0
+```
+
+として、各 branch の出力を `hot_mask` / `cold_mask` で潰して加算します。`weights = ggml_get_rows(probs, selected_experts)` は global ID のままです。
+
+(b) loader in-memory split は、既存 GGUF 互換を残したい場合の fallback としてはありですが、正しさの表面積が大きいです。特に「別 buffer 配置」が目的なら view では足りず、実データコピーと loader 経路の拡張が必要になります。注意点として、mask 方式の2分岐は正しい一方で hot/cold 両方を全 top-k slot で計算するため、最大性能を狙うなら後で compact/scatter 方式が別途必要です。
+tokens used
+91,186
+推奨は **(a) GGUF 前処理で物理2分割 + router ID permute** です。実装量も正しさもこちらが堅いです。
+
+理由:
+
+- `ggml_mul_mat_id` は `src0/as = [cols, rows, n_expert]`, `ids = [n_expert_used, n_tokens]` を前提にし、ID は `0 <= id < src0->ne[2]` でなければなりません。根拠: [ggml.c:3280](/home/hikari/src/llama.cpp/ggml/src/ggml.c:3280), [ggml.c:3296](/home/hikari/src/llama.cpp/ggml/src/ggml.c:3296), [ggml-cpu.c:1620](/home/hikari/src/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1620)。
+- `selected_experts` は `top_k` の元 ID のまま、重み取得にも expert matmul にも使われています。根拠: [llama-graph.cpp:1458](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1458), [llama-graph.cpp:1471](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1471), [llama-graph.cpp:1543](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1543), [llama-graph.cpp:1561](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1561), [llama-graph.cpp:1651](/home/hikari/src/llama.cpp/src/llama-graph.cpp:1651)。
+- loader 側は現状、GGUF tensor 名からそのまま tensor を作り、op/buffer を選びます。in-memory 分割だと virtual tensor 生成、mmap/split-file/quantized row のコピー、buffer override、tensor check をまたぐ必要があり重いです。根拠: [llama-model-loader.cpp:1078](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1078), [llama-model-loader.cpp:1183](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1183), [llama-model-loader.cpp:1251](/home/hikari/src/llama.cpp/src/llama-model-loader.cpp:1251)。既存の MoE tensor は `MUL_MAT_ID` 扱いです: [llama-arch.cpp:705](/home/hikari/src/llama.cpp/src/llama-arch.cpp:705)。
+
+実装方針は、GGUF 前処理で hot expert を `0..207`、cold expert を `208..255` に並べ替え、`ffn_gate_inp` の expert 出力次元、`exp_probs_b`、per-expert scale/bias があればそれらも同じ permute/split します。runtime では global `selected_experts` は重み取得用に保持し、matmul 用にだけ:
+
+```text
+hot_ids  = id < 208 ? id       : 0
+cold_ids = id >= 208 ? id - 208 : 0
+```
+
+として、各 branch の出力を `hot_mask` / `cold_mask` で潰して加算します。`weights = ggml_get_rows(probs, selected_experts)` は global ID のままです。
+
+(b) loader in-memory split は、既存 GGUF 互換を残したい場合の fallback としてはありですが、正しさの表面積が大きいです。特に「別 buffer 配置」が目的なら view では足りず、実データコピーと loader 経路の拡張が必要になります。注意点として、mask 方式の2分岐は正しい一方で hot/cold 両方を全 top-k slot で計算するため、最大性能を狙うなら後で compact/scatter 方式が別途必要です。

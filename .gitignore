@@ -1,0 +1,9 @@
+# reproducible logs / huge dumps / binaries
+harness/out/*.log
+harness/out/*.jsonl
+harness/out/*.json
+harness/poc_overlap
+harness/sched_overlap
+harness/sched_overlap2
+harness/manual_overlap
+harness/manual_moe_overlap

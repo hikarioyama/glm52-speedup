@@ -1,0 +1,3 @@
+llama.cpp master で MoE cold expert を host-pinned(CUDA_Host)に置き GPU が PCIe で読む/prefetchする構想の「殺す要因」を敵対的に列挙。
+具体: (1)UVA で host を読む mul_mat_id の実効帯域は device-resident 比で何倍落ちるか(キャッシュ無し・PCIe律速)、Q2量子化 MMVQ カーネル(mmvq.cu)が host src を受けるか/per-element PCIe往復で破滅しないか (2)mul_mat_id dispatch(ggml-cuda.cu:2622, :2629 split-buffer assert)が host src0 に課す制約 (3)ggml-backend-sched が op ごとに backend 切替する overhead (4)pinned 42GB 確保の是非。
+各々 file:line 根拠 + 致命度(致命/回避可/軽微)。簡潔に。

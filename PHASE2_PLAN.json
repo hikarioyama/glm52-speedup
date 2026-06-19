@@ -1,0 +1,258 @@
+{
+ "design": {
+  "graph_on_or_off": "ON for the GPU compute split (decisive, source-confirmed; reconciles R1=ON vs R2/R3/R4 \"OFF when split used\"). R2/3/4 conflated CUDA *split-buffer* (the `-ts` cross-GPU row-split buffer type, `ggml_backend_buft_is_cuda_split`, common.cuh:1083) with the *split-backend scheduler* used by `-ot` host placement. The two graph-disabling conditions in ggml_cuda_graph_check_compability (ggml-cuda.cu:3253, 3261) BOTH evaluate FALSE for this config: (1) Expert weights live in a CPU/host buffer via -ot, not a cuda_split buffer, so 3253 does not fire. (2) For MUL_MAT_ID at 3264, `node->ne[2]` is n_tokens (confirmed from ggml_mul_mat_id: result ne = {rows, n_expert_used, n_tokens, 1}), which is 1 at decode; mmvq_mmid_max on Blackwell (cc=1200 >= ADA_LOVELACE 890) returns MMVQ_MAX_BATCH_SIZE=8 unconditionally (mmvq.cu:244-245), so `1 > 8` is FALSE and src[0] is quantized (IQ2_XS/IQ3_XXS), so 3264 does not fire. CONSEQUENCE FOR OVERLAP: the captured graph contains only the GPU compute-split nodes. The per-token expert H2D copies are issued in the SCHEDULER loop OUTSIDE capture (ggml-backend.cpp:1630 ggml_backend_tensor_set_async) and execute eagerly on cuda_ctx->stream() (=stream curr_stream_no, default 0; ggml-cuda.cu:3143), then the compute graph is launched on the SAME stream 0 (1678 -> 4454 -> 4505/launch). Serialization is pure same-stream FIFO ordering, NOT a capture constraint. So overlap = move copies to a separate stream + event handshake; capture is untouched. MUST verify in test_protocol with GGML_CUDA_GRAPH debug log (NDEBUG-gated \"disabling CUDA graphs...\" messages) that graph stays enabled with -ot on this exact GLM-5.2 graph, since group-topk path (llama-graph.cpp:1440-1454, glm-dsa uses expert groups) adds set_rows/argsort nodes whose graph-compat is assumed not asserted.",
+  "overlap_budget": "Per-MoE-layer used-expert copy = top-8 distinct experts x 15.1MB/expert (gate 4.03 + up 4.03 + down 7.05, IQ2_XS+IQ3_XXS) = ~121MB; but distinct-expert grouping (1623-1660) and 19 host layers vs 60 GPU layers matters: only the host-placed layers trigger copy. At 57.7GB/s single-GPU that copy is ~2.09ms/layer (1.05ms if split across 2 GPUs). GPU compute available to hide it WITHIN the same layer = shared-expert FFN (deepseek2.cpp:405-410, depends only on `cur`, NOT selected_experts) + the MLA attention of the layer. Shared-expert FFN is small (d_model 6144 -> shexp FFN, single matmul pair) ~ sub-ms; MLA attention with KV head=1 is also light at decode. Realistic same-layer hideable GPU work ~1-3ms. PATH-ALPHA realistic ceiling: hiding ~50-70% of the 2.09ms host-copy behind shared-expert+attn => ~38.2ms -> ~36-37ms => ~27-28 t/s. Marginal over 26.15 (the honest verdict: alpha barely clears 26, consistent with R2's ~0.5-1ms estimate; the +39 t/s figure in the brief is optimistic and assumes copy is the sole bottleneck, but confirmed律速 is host RAM bandwidth on the CPU-compute layers, which alpha does NOT touch). PATH-BETA ceiling: only if hot set fits VRAM so that NO host copy is on the critical path and the residual cold copy (small) is fully hidden behind hot-compute + attention across both GPUs (115GB/s). Then per-token traffic drops from 1.7-1.9GB to the cold-only tail. If hot=208 experts resident and cold=48 host, cold per-token copy ~ (8 * P(cold) * 15.1MB); with near-uniform routing P(cold)=48/256=18.75% => ~1.5 experts/token => ~23MB/layer => ~0.4ms, fully hideable. Beta realistic ceiling ~36ms-class -> ~55-77 t/s depending on whether hot truly fits and host-RAM-bandwidth layers are eliminated. The honest gating fact: 222GB routed > 192GB VRAM, so beta MUST still keep ~30GB on host; the win is making that 30GB the SMALL cold tail with low access frequency, not the hot mass.",
+  "alpha_design": "Goal: overlap the eager expert H2D copies with the same-layer shared-expert FFN + attention, keeping CUDA graph ON. Mechanism = move the host->GPU expert copies off stream 0 onto a dedicated prefetch stream and insert an event handshake before the compute-graph launch. Concrete: (a) In ggml/src/ggml-cuda/common.cuh add a fixed prefetch stream index (reuse the existing 8-stream pool, e.g. reserve stream index 7 as PREFETCH_STREAM_NO; streams[device][7] is lazily created by the existing stream(device,7) API at 1437, no struct growth needed) plus one cudaEvent_t prefetch_event[GGML_CUDA_MAX_DEVICES] (cudaEventDisableTiming). (b) Add a backend entry point ggml_backend_cuda_set_tensor_async_stream(backend, tensor, data, off, size, stream_no) that issues cudaMemcpyAsync on stream(device, stream_no) instead of stream() — a 3-line clone of 3137-3143. (c) In ggml/src/ggml-backend.cpp copy_experts lambda (1624-1636): issue the copies via the new stream-qualified async set on the prefetch stream. After the copy loop (after 1660), record prefetch_event on the prefetch stream. (d) Critically, the kept synchronize at 1607 reads IDs D2H on stream 0; leave it (IDs are tiny, sub-us) BUT the expensive expert copies now run on stream 7 concurrently while the scheduler proceeds. (e) Before the compute launch at 1678, inject cudaStreamWaitEvent(stream0, prefetch_event) so the captured graph's MUL_MAT_ID waits only on copy completion, not on FIFO position — this lets the *previous* split's shared-expert/attention graph (already running on stream 0) overlap the stream-7 copy. The overlap is realized because shared-expert FFN (deepseek2.cpp:405) is emitted as GPU work that does NOT consume selected_experts, so the scheduler can have it in-flight on stream 0 while stream 7 copies the routed experts for the MoE matmul split. Insertion is purely in the scheduler copy path + one new async-set variant; NO changes inside graph capture, so graph stays ON. Risk-contained: if event handshake regresses, a GGML_MOE_PREFETCH_STREAM=0 env falls back to current behavior.",
+  "beta_design": "Goal: physically split routed experts into hot[0..207] (GPU-resident, both GPUs) + cold[208..255] (host), so per-token critical path no longer reads the 1.7-1.9GB host expert mass; only the small cold tail crosses PCIe and is hidden behind hot-compute. Identity split (no router permutation) is valid ONLY IF routing is near-uniform so cold-tail access frequency is low — the brief asserts this from profile; test_protocol MUST re-confirm the id-histogram before committing the 208/48 boundary (open question, verify with real tokens). Architecture: (1) GGUF preprocess (new gguf-py/scripts/split_moe_experts.py): for each blk.{l}.ffn_{gate,up,down}_exps.weight, slice expert axis ne[2]=256 at byte stride nb[2] into a hot slab [..,..,208] and a cold slab [..,..,48]; pure byte memcpy of whole-expert quant blocks (slab boundary == expert boundary, dequant-free, byte-safe per confirmed fact). Emit new tensors blk.{l}.ffn_{gate,up,down}_exps (208) and blk.{l}.ffn_{gate,up,down}_exps_cold (48). Router tensors ffn_gate_inp, ffn_exp_probs_b unchanged (identity split). (2) llama-arch.h: add LLM_TENSOR_FFN_{GATE,UP,DOWN}_EXPS_COLD enum + name strings. (3) llama-model.h: add ffn_{gate,up,down}_exps_cold pointers to llama_layer. (4) glm-dsa.cpp load_arch_tensors: create_tensor for the cold tensors with {..,..,48}; place hot on GPU, cold on host (extend the -ot/tensor_buft_override regex to catch _cold suffix, common/arg.cpp). (5) llama-graph.cpp build_moe_ffn: after selected_experts (1458), keep ONE argsort over full 256 logits. Then do the hot matmul with selected_experts as-is against the 208-expert tensor — but MUL_MAT_ID requires ids in-range, so build hot-mask: clamp/replace ids>=208 with a sentinel that get_rows treats safely (verify ggml_get_rows out-of-range behavior — open question) OR run two MUL_MAT_ID: hot with ids masked to <208 and cold with ids_cold = ids-208 masked to >=0, then combine by per-token weight mask + add. The cold branch's input_cpy still triggers the scheduler host-copy path (1576) but now only for the 48-expert cold slab => small. Place hot experts split across GPU0+GPU1 so both GPUs compute, and let cold copy ride stream 7 (alpha mechanism) hidden behind hot+shared+attn. The two-branch combine must preserve weight normalization: normalize weights over the full top-8 BEFORE splitting (weights computed at 1471-1496 over full selected_experts), then apply matching weight slices to hot/cold outputs and ggml_add. CUDA graph: cold branch still host-weight -> still triggers scheduler copy outside graph, graph stays ON for hot+shared compute (same reasoning as above).",
+  "files_to_change": [
+   {
+    "file": "/home/hikari/src/llama.cpp/ggml/src/ggml-cuda/common.cuh",
+    "phase": "alpha",
+    "change": "Add PREFETCH_STREAM_NO=7 constant and cudaEvent_t prefetch_event[GGML_CUDA_MAX_DEVICES] (cudaEventDisableTiming) to ggml_backend_cuda_context (~1365-1476). Reuse existing stream(device,7) lazy-create; no pool struct growth."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu",
+    "phase": "alpha",
+    "change": "Clone set_tensor_async (3137-3143) into a stream-qualified variant issuing cudaMemcpyAsync on stream(device,stream_no); expose via backend iface or a直接 helper callable from sched. Do NOT touch graph capture (4454-4511)."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/ggml/src/ggml-backend.cpp",
+    "phase": "alpha",
+    "change": "copy_experts lambda (1624-1636): route the expert H2D copies onto the prefetch stream; after copy loop (post-1660) cudaEventRecord(prefetch_event). Before compute launch (1678) inject cudaStreamWaitEvent(stream0, prefetch_event). Keep IDs sync at 1607 (tiny). Add GGML_MOE_PREFETCH_STREAM env fallback to current path."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/gguf-py/scripts/split_moe_experts.py",
+    "phase": "preprocess",
+    "change": "NEW: read blk.*.ffn_{gate,up,down}_exps.weight, slice expert axis ne[2]=256 at byte stride nb[2] into hot[208]+cold[48] slabs (byte memcpy, no dequant), write *_exps (208) + *_exps_cold (48). Router tensors copied unchanged. Re-shard to 7-file output."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/src/llama-arch.h",
+    "phase": "beta",
+    "change": "Add LLM_TENSOR_FFN_{GATE,UP,DOWN}_EXPS_COLD enum entries + name-map strings 'blk.%d.ffn_{gate,up,down}_exps_cold'."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/src/llama-model.h",
+    "phase": "beta",
+    "change": "Add ggml_tensor* ffn_{gate,up,down}_exps_cold (=nullptr) to llama_layer near 289-302."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/src/models/glm-dsa.cpp",
+    "phase": "beta",
+    "change": "load_arch_tensors: create cold tensors {n_embd,n_ff_exp,48} (down transposed dims). Default-place hot on GPU(s), cold on host."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/src/llama-graph.cpp",
+    "phase": "beta",
+    "change": "build_moe_ffn (1352-1673): after selected_experts (1458) and weight-norm (1471-1496), split into hot (ids<208) and cold (ids-208) MUL_MAT_ID branches against *_exps and *_exps_cold; combine with masked weights + ggml_add. Guard out-of-range ids per get_rows semantics. Pass cold tensors via new optional build_moe_ffn args."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/src/models/deepseek2.cpp",
+    "phase": "beta",
+    "change": "build_moe_ffn call (388-400): pass model.layers[il].ffn_{gate,up,down}_exps_cold as new optional args (default nullptr keeps other archs unaffected)."
+   },
+   {
+    "file": "/home/hikari/src/llama.cpp/common/arg.cpp",
+    "phase": "beta",
+    "change": "Extend tensor_buft_override regex helper so --offload-aux / -ot catches '_cold$' to pin cold experts to host while hot stays on GPU."
+   }
+  ],
+  "test_protocol": "Model load is 4-5 min, so use a persistent server + minimal-cycle protocol; never reload per micro-change. (1) GRAPH-STATUS check first (cheap, gates everything): build with NDEBUG off (or add a temporary always-on log), launch with current best -ot config, send 1 short decode, grep stderr for 'disabling CUDA graphs' from ggml_cuda_graph_check_compability (3256/3270). EXPECT none => confirms graph ON for GLM-5.2 group-topk MoE decode. If it DOES disable, the whole stream-handshake assumption changes (capture would re-serialize) — record which condition fired. (2) CORRECTNESS (must pass before any perf claim): with a FIXED seed and temp=0, capture the exact token-id sequence of a ~64-token greedy completion on baseline binary; after each of alpha and beta, re-run identical prompt/seed and assert byte-identical token-id stream (alpha must be bit-identical since it only reorders copies; beta must be identical IF identity split + correct weight combine — any divergence = combine/normalization bug or get_rows out-of-range). For beta also dump the per-token expert-id histogram (instrument used_ids at 1616) over ~200 tokens to VALIDATE the 208/48 boundary assumption BEFORE trusting perf. (3) PERF: same server, run llama-bench-style decode (e.g. 256 tokens, 3 reps) measuring t/s, compare to 26.15 baseline. Alpha gate = sustained >26.15 with graph still ON; beta gate = the cold-tail per-token host traffic drops (confirm via nvidia-smi PCIe RX and the instrumented copy bytes/token) AND t/s rises. (4) Two-GPU saturation check: nvidia-smi dmon 30s, require BOTH GPUs >70% util in beta (per the dual-saturation requirement) — single-GPU-busy means the hot split didn't distribute. Minimal cycle: keep one server warm per binary variant; iterate flags/env (GGML_MOE_PREFETCH_STREAM) without reload where possible.",
+  "staging_decision": "No separate staging ring is required for the H2D itself: the expert source already lives in a HOST buffer (CPU placement via -ot), and to be DMA-async it must be PINNED. Verify the -ot/--no-mmap host buffer is allocated via cudaMallocHost (ggml-cuda.cu:1493-1524 ggml_cuda_host_malloc) and NOT a pageable mmap region — confirmed-fact run uses --no-mmap which is consistent with pinned host alloc, but check GGML_CUDA_NO_PINNED is unset (1494) else copies silently become sync/pageable and the whole stream-overlap plan dies. If the host expert buffer is pinned, cudaMemcpyAsync on the prefetch stream is genuinely async directly from it — no intermediate staging buffer, no extra copy. Recommendation: 0 extra staging buffers for alpha; rely on the existing pinned host weight allocation. For beta, the cold host slab (48 experts/layer) likewise stays in the same pinned host buffer type. ONLY introduce a small pinned ring (2-3 buffers x max-expert-group-size ~121MB) IF profiling shows the source host buffer is not pinnable (e.g. user must keep mmap for the 222GB working set); in that fallback, ring lives in GPU-context init, sized 3 x 16MB-rounded-expert-slab, round-robin, allocated once at backend init (not per token).",
+  "top_risks": [
+   "Pinned-host assumption: if the -ot host expert buffer is pageable (mmap, or GGML_CUDA_NO_PINNED set), cudaMemcpyAsync on a side stream will not actually overlap (driver staging serializes) — alpha gives ~0 gain. MUST verify pinned allocation in step 0 of testing.",
+   "Real律速 is host RAM bandwidth on the 19 CPU-compute layers (confirmed fact), which alpha does NOT address — alpha only hides the H2D PCIe copy, not the CPU-side expert read at 50GB/s. So alpha's ceiling is genuinely near 26-28 t/s, not 39. Beta is the only path that attacks the actual bottleneck (by moving the hot mass onto GPU so those layers compute on-device).",
+   "Beta identity-split validity hinges on near-uniform routing; if GLM-5.2 routing is skewed toward high-id experts, cold[208-255] gets hit often and the cold-tail copy reappears on the critical path. Histogram MUST be measured (it currently is an assumption, not source-verified).",
+   "MUL_MAT_ID out-of-range ids: the hot/cold two-branch needs ids clamped/masked; ggml_get_rows behavior on out-of-range index (clip/NaN) is unverified (R4 open q). A wrong-mask bug would corrupt output silently — caught only by the bit-identity test.",
+   "CUDA graph property-change churn: glm-dsa group-topk emits set_rows/argsort/fill nodes per layer; if any per-token shape varies, ggml_cuda_graph_update_required (4472) resets warmup and graph never stabilizes, silently falling back to eager and changing the overlap arithmetic. Confirm warmup_complete stays true across tokens.",
+   "Stream-7 collision with concurrent_event fork/join (ggml-cuda.cu:4234-4250 uses streams 1..n for multi-stream graph optimization). Reserve a high index (7) and confirm GLM decode does not itself spawn concurrent_events on 7, else copy and compute fork collide.",
+   "Weight-normalization in beta two-branch: weights are normalized over full top-8 (1482-1496); splitting AFTER normalization and recombining by mask is correct, but doing it before/with wrong reshape breaks the softmax-sum — high-blast-radius correctness risk, gate on bit-identity test."
+  ]
+ },
+ "verdicts": [
+  {
+   "angle": "overlap予算: decode 1層あたり「copyを隠せる独立GPU計算」が実在するか (R2の数字を実コードで再計算)",
+   "survives": false,
+   "fatal_flaws": [
+    {
+     "flaw": "道αの同一層overlap予算が破綻。alpha_designの明示メカニズムは『expert H2D copyを同一層のshared-expert FFN + MLA attentionの裏に隠す』。だがdecode(1 token)ではこの2つはVRAM帯域律速で極小。shared-expert FFN=6*d_model*n_ff_exp=75.5 MFLOP、量子化weight~15.1MB/1.7TB/s=0.009ms。MLA(KV head1)attn weight read proxy~0.018ms。同一層hideable合計 ~0.027ms。対して隠す対象のtop-8 H2D copy=8*15.11MB=120.9MB → 57.7GB/s(単GPU)で2.09ms、115GB/s(両GPU)で1.05ms。hideable/copy = 0.027/1.05 = 2.5%。同一層overlapは原理的にcopyの2.5%しか隠せず、ユーザ指摘どおり『copy律速で26を超えない』。alpha_designが主張する『~50-70%を隠す』根拠が実コードのテンソル寸法(n_ff_exp=2048, n_expert_shared=1, glm-dsa.cpp:128-135)と矛盾。",
+     "severity": "fatal",
+     "evidence": "src/models/glm-dsa.cpp:128-135 (ffn_*_exps {6144,2048,256}, shexp {6144,2048}); n_expert_shared=1; roofline: shexp 6*6144*2048=75.5MFLOP→VRAM-read 15.1MB/1.7TB/s=0.009ms, attn proxy 0.018ms, 計0.027ms vs copy 120.9MB→2.09ms(57.7GB/s)/1.05ms(115GB/s)。ratio=0.025"
+    },
+    {
+     "flaw": "道αが実際の律速を一切攻撃しない(設計自身がtop_risks#2で自認しつつ矛盾した結論を残す)。確定事実: 現best 26.15 t/sでは19層を -ot=CPU でhost配置→これらはCPU compute、weightをRAM 50GB/sで1.8GB/token読む=36ms。これが律速。ところがαが overlapする used-expert H2D copy path(ggml-backend.cpp:1576-1660)は『weightがhost buffer かつ matmul nodeがCUDA split backendに割当』の場合のみ発火する別経路。CPU computeの-ot=CPU層ではmatmulがCPU backendで走り、H2D copy自体が存在しない=critical pathに無い。よってαの t/s 改善はゼロに近い。alpha_designの『~27-28 t/s』はphantom copyを隠す計算で、26.15を生んでいる実コスト(RAM read)に触れていない。",
+     "severity": "fatal",
+     "evidence": "ggml-backend.cpp:1576-1578 (USAGE_WEIGHTS && is_host(input->buffer) && node on split_backend が発火条件); 確定事実『host配置expertを毎token RAM帯域50GB/sで読む1.7-1.9GB/token...CPU compute(11ms)でなくRAM帯域律速』; 設計top_risks#2が同旨を自認"
+    },
+    {
+     "flaw": "cross-layer pipeline(prefetchで次層copyを今層compute裏に)に解釈し直しても copy-bound で天井は低い。GPU-compute MoE層の per-layer GPU計算 = top-8 MUL_MAT_ID の VRAM read 120.9MB/1.7TB/s=0.071ms。対 copy 1.05ms(両GPU)。compute/copy=0.068。完全overlapしても floor=copy時間=19層*1.05ms≈20ms、+GPU側残り~5ms ≈ 25ms → 天井~40 t/s だが、これは『copyが唯一のhostコスト』『hot massが全部PCIe経由』という、現状(RAM read 36ms)とは別レジームを仮定したときの数字。現状の-ot=CPU配置のままではαは無効、PCIe-only配置に変えると今度はRAM readが消える代わりにPCIe copyが律速で、いずれにせよ copy-bound。alpha単独で+39 t/sは到達不能。",
+     "severity": "major",
+     "evidence": "MoE matmul VRAM-read 8*15.1MB/1.7TB/s=0.071ms vs copy 1.05ms, ratio 0.068; 完全overlap floor 19*1.05+5≈25ms→40t/s(別レジーム前提)"
+    },
+    {
+     "flaw": "道βの天井55-77 t/sは『hot mass全部VRAM常駐で当該層がon-device compute、cold tailのみPCIe』を前提とするが、これは正しく実装できれば律速を真に攻撃する唯一の経路(ユーザの問いの範囲外だがαとの対比で重要)。ただしbeta_design自体に未検証の前提(routing均一でcold[208-255]アクセス頻度低、get_rows out-of-range挙動、weight正規化のsplit順序)が積み重なり、確実性は低い。βが本命でありαは副次という設計の段階方針自体が、overlap予算の現実(αはほぼ無効)と整合しない——αを天井39の独立ステップとして売る記述は誤り。",
+     "severity": "minor",
+     "evidence": "beta_design: 222GB>192GB ゆえ最低30GB host不可避、cold-only尾0.4ms/層は hideable だが識別split妥当性は histogram 未測定(設計自身open question)"
+    }
+   ],
+   "required_fixes": [
+    "alpha_designの『同一層shexp+attnの裏にcopyを隠す』主張を撤回し、cross-layer prefetch(次層expert copyを前層のGPU compute全体——MoE matmul含む——の裏に出す)に書き換える。ただしその場合でもroofline上copy-bound(compute/copy=0.068)なので、αの正直な天井は『copyを直列から外して floor=copy時間に下げる』だけ、と数値を訂正。+39 t/sは削除。",
+    "αを適用する前提として、現状の-ot=CPU配置(19層CPU compute, RAM律速36ms)では used-expert H2D copy path が発火しないことを test_protocol step0 で確認必須。発火しないなら α は no-op。αを有効化するには該当層を『weight=host buffer かつ matmul=CUDA backend(offload mode)』に明示配置する必要があり、その配置自体が現best 26.15 を生んだ -ot=CPU とは別物——配置変更込みでベンチし直す。",
+    "αの copy を両GPUに分散(115GB/s)し、かつ used-expert grouping/dedup(ggml-backend.cpp:1623-1660)後の実コピー量を実測。top-8が連続IDに固まればコピーstride数が減り padding 512B*group 回数も減る。実バイト/token を nvidia-smi PCIe RX で測ってから天井を引き直す。",
+    "本命を道βに明確に格上げし、αは『βの cold-tail copy を隠すための前処理(stream分離+event handshake)』として位置付ける。α単独を独立した速度ステップとして売らない。",
+    "道βの前提3点を commit 前に必ず実測検証: (1) expert-id histogram で恒等split 208/48 の cold アクセス頻度<20%、(2) ggml_get_rows の out-of-range index 挙動(clamp/NaN)、(3) weight正規化を full top-8 で行ってから hot/cold に slice する順序。いずれも bit-identity test(temp=0 固定seed 64token greedy)で gate。",
+    "pinned-host前提の検証を全 perf 主張の step0 に固定: -ot host buffer が cudaMallocHost 経由(ggml-cuda.cu:1493-1524)で GGML_CUDA_NO_PINNED 未設定であることを確認。pageable なら side-stream cudaMemcpyAsync は driver staging で直列化し α/β とも overlap ゼロ。"
+   ]
+  },
+  {
+   "angle": "正しさ (mask/id-remap, 恒等split数値一致, ids D2H非同期race, 量子化slab byteアライン)",
+   "survives": false,
+   "fatal_flaws": [
+    {
+     "flaw": "道βの hot/cold 二分岐は『clamp/sentinel で ids>=208 を安全化』では数値が壊れる。MUL_MAT_ID の expert index は mmvq.cu:425 `channel_x = ids[channel_dst]` で境界チェック無しに直接 channel(expert)を選ぶ。さらに最終集約は llama-graph.cpp:1668 で experts[n_embd,8,n_tokens] に weights[1,8,n_tokens] を『スロット位置』キーで掛け、1679-1697 で 8 スロット全部を ggml_add で合算する。つまり id を sentinel(例 0)に clamp すると、その hot 分岐は『expert 0 を計算しスロット重み付きで加算』してしまい無音で誤出力になる。設計の『masked weights』が成立するには、hot 分岐では cold スロットの weight を 0、cold 分岐では hot スロットの weight を 0 にした2系統の weight テンソルを作り、かつ両分岐の 8-slot 合算結果を ggml_add する必要がある。これは設計が『恒等split で router 無改変』と言う主張と矛盾する重い graph 改造で、weight 正規化(1482-1496 で full top-8 上で実施済)との整合・reshape を1つ誤ると softmax-sum が壊れる。設計の記述レベルでは未解決。",
+     "severity": "fatal",
+     "evidence": "mmvq.cu:425 channel_x=ids[channel_dst](bounds check無), llama-graph.cpp:1668 experts*weights(slot-keyed), 1679-1697 8-slot ggml_add aggregation, weight norm at 1482-1496"
+    },
+    {
+     "flaw": "道βの『恒等split で router 無改変=数値一致』は MUL_MAT_ID 単体では成立しない。hot テンソルは expert 208個に縮むので、selected_experts(値域0-255)をそのまま 208-expert テンソルに食わせると id>=208 が OOB read(segfault or garbage、NaN ですらない)。よって必ず ids の remap(hot は<208へmask, cold は id-208)が必要で、『router 無改変で十分』は誤り。恒等split が router permute 不要なのは『どの expert を hot に選ぶかが任意』という意味でしか正しくなく、graph 側の id remap は必須。設計は build_moe_ffn に remap を入れると書きつつ『identity split (no router permutation) is valid』と本文先頭で言い切っており自己矛盾。",
+     "severity": "fatal",
+     "evidence": "glm-dsa.cpp:128-130 exps {n_embd,n_ff_exp,n_expert=256}, mmvq.cu:425 no-range-check, beta_design 冒頭 'Identity split (no router permutation) is valid' vs build_moe_ffn 'clamp/replace ids>=208'"
+    },
+    {
+     "flaw": "道αの overlap は ids 依存で原理的に頭打ち。ggml-backend.cpp:1606-1607 で ids を D2H 同期取得→used_ids bitset→copy する byte offset がこの ids に依存する真のデータ依存。graph ON 時 decode は層 N の argsort 含む全 graph が1回の launch で走るため、層 N の copy に必要な ids は graph がその層に到達するまで生成されない。設計(e)の『前 split の compute と現 split の copy を overlap』は、ids 生成が graph 内部にある以上、prefetch stream に積んでも ids 確定まで待たされ overlap 窓が縮む。設計自身も α天井を27-28t/s(26.15比+数%)と認め、真の律速=CPU計算層の host RAM 帯域(50GB/s)を α は触らないと明記。投資対効果が極小。",
+     "severity": "major",
+     "evidence": "ggml-backend.cpp:1606 get_async + 1607 synchronize, ids依存の copy offset(1623-1635), overlap_budget 'alpha barely clears 26', top_risks#2 'Real律速 is host RAM bandwidth on the 19 CPU-compute layers which alpha does NOT address'"
+    },
+    {
+     "flaw": "pinned-host 前提が未検証かつ既定で崩れる可能性大。cudaMemcpyAsync が真に async なのは source が pinned(cudaMallocHost)時のみ。だが -ot regex=CPU は通常 CPU backend buffer(pageable)を選ぶ。CUDA pinned host buffer(ggml-cuda.cu:1510 ggml_backend_cuda_host_buffer_type)に載るとは限らない。pageable なら side-stream copy は driver 内部 staging で serialize し α は ~0 gain。設計は『--no-mmap ⟹ pinned』と仮定するがこれは保証されない(--no-mmap は mmap 回避であって buffer type を host-pinned に強制しない)。pinned 化には override を CUDA host buffer type へ振る追加コード変更が要る。",
+     "severity": "major",
+     "evidence": "ggml-cuda.cu:1493-1510 ggml_cuda_host_malloc(cudaMallocHost), ggml-backend.cpp:1580 ggml_backend_buffer_is_host(CPU bufも true), staging_decision 'check it is cudaMallocHost NOT pageable mmap', top_risks#1"
+    },
+    {
+     "flaw": "設計の file 群に GLM の実体未確認による方向ズレ（軽微、本文は結果的に正しい）: deepseek2.cpp:388-400 の build_moe_ffn 呼び出しは fused gate_up を渡す第1 overload(llama-graph.cpp:1310)経由で、GLM では ffn_gate_up_exps=nullptr のため separate path(1543-)に入る。設計が beta で『gate/up を別 slab に slice』するのは GLM では正しいが、deepseek2.cpp の同一呼び出しを共有する他 arch(fused 系)に optional cold 引数を足すと回帰しうる。GLM が deepseek2::graph を using で共有(models.h:1013)している点は設計の deepseek2.cpp targeting を正当化するが、その副作用範囲(共有 graph)を設計は明示していない。",
+     "severity": "minor",
+     "evidence": "models.h:1013 'using graph = llama_model_deepseek2::graph;', deepseek2.cpp:388-400 calls 1st overload with ffn_gate_up_exps(=nullptr for GLM), llama-graph.cpp:1517 if(gate_up_exps) else separate path"
+    }
+   ],
+   "required_fixes": [
+    "道β二分岐の正しさを担保する具体設計を書く: full top-8 上で重み正規化(1482-1496)した後、(a) hot_ids = clamp(ids,0,207) と hot_w = weights * (ids<208 ? 1:0)、(b) cold_ids = clamp(ids-208,0,47) と cold_w = weights * (ids>=208 ? 1:0) を graph op(ggml で比較mask生成)で作り、hot/cold 各々で MUL_MAT_ID→weight 乗算→8-slot 合算し、最後に ggml_add。sentinel clamp だけでは誤加算するので weight zero-mask が必須。",
+    "bit-identity test を gate にする前に、まず単一層・単一トークンで hot-only(全 expert を hot 配置=cold空)構成を作り baseline と byte 一致を確認(remap/mask 配線の単体検証)。その後で 208/48 split を入れる段階分割。",
+    "MUL_MAT_ID の OOB 挙動を実測で確定する(mmvq.cu:425 は範囲チェック無し)。clamp 後の id が必ず in-range であることを graph 構築側で保証し、ASSERT を入れる。get_rows ではなく mmvq/mmq の expert indexing が対象である点を設計に反映。",
+    "pinned-host を実測で確認: 起動後に -ot host expert buffer の buft が ggml_backend_cuda_host_buffer_type か(pageable CPU buf でないか)を確認。pageable なら override を CUDA host buffer type に振るコード変更を追加するか、small pinned ring(3×~16MB round-robin, backend init で一度確保)を α/β 共通で導入。",
+    "道α単独では真の律速(CPU計算層の host RAM 帯域)に届かない事実を受け、α は β の前提インフラ(prefetch stream + event)としてのみ位置づけ、性能 KPI は β に一本化する。α 単独 +39t/s 主張は撤回し +数% と明記。",
+    "ids 依存による overlap 窓の制約を定量化: graph ON 一括 launch 下で層 N の copy が層 N の argsort 後にしか発行できない点を test_protocol に組み込み、実際に前層 compute と現層 copy が重なるか nsys/event timing で確認(重ならなければ β でも cold-copy hide は崩れる)。",
+    "deepseek2::graph 共有による他 arch 回帰を防ぐため、cold 引数は完全 optional(default nullptr)かつ glm-dsa 経路でのみ非nullとし、fused gate_up 系 arch での挙動を回帰テストに含める。",
+    "量子化 slab byte アラインは IQ2_XS(QK=256, block 66B)/IQ3_XXS で expert 境界=ne2 が block 境界に一致するかを split スクリプトで assert(nb[2] % block_size == 0 と expert_size % type_block == 0)。設計は『dequant-free byte-safe』を前提とするが、208/48 の任意境界でも各 expert slab 先頭が block 境界であることを数値確認(各 expert の ne0*ne1 が QK で割り切れること)を required にする。"
+   ]
+  },
+  {
+   "angle": "scheduler/CUDA-graph相性: prefetch streamへのcopy移設 + event handshake改造が、ggml-backend schedulerのsplit実行モデル(cur_copyダブルバッファ/sched->events/per-split barrier)とCUDA graph captureを壊さないか",
+   "survives": false,
+   "fatal_flaws": [
+    {
+     "flaw": "【overlap対象が同一split内に存在しない — alpha設計の致命的前提誤り】設計は『shared-expert FFNがstream0で走っている間にstream7でexpert copyする』overlapを主張するが、scheduler構造上これは成立しない。-ot host配置では MUL_MAT_ID の計算自体はGPU backendで走り(host上にあるのはWEIGHTだけ=split inputとして扱われる)、shared-expert FFN・attention・MoE matmul は全て同一の巨大なGPU split に属する。ggml_backend_sched_compute_splits (ggml-backend.cpp:1541) の各splitは『全input copyを発行(1556-1675ループ)→その後 graph_compute_async(1678)』という固定順序。つまり当該splitのcopyは当該splitのcompute全体に先行発行される。copyをstream7へ逃がしても、そのcopyが供給するMUL_MAT_IDと、overlap相手にしたいshared-expert FFNは『同一graph launch』に内包され、graph全体がstream0でcopy完了eventを待ってから一括起動される。よって同一split内に『copyと独立にstream0で先行実行できるcompute』は存在しない。overlapできるのは『前tokenの末尾compute』程度で、設計の『同一layerのshexp/attn裏に隠す』は構造的に不可能。",
+     "severity": "fatal",
+     "evidence": "ggml-backend.cpp:1556-1675(input copyループ)→1678(graph_compute_async)が固定順序。MUL_MAT_ID計算はGPU backend(deepseek2.cpp:388-400 build_moe_ffn→GPU)、host weightはinput_cpy。graph_keyは単一(全GPU layer1つのcaptured graph)"
+    },
+    {
+     "flaw": "【CUDA graph ON時、stream7 copy → graph内MUL_MAT_IDへのevent依存をcaptureに注入できない】設計(e)は『capture前のstream0にcudaStreamWaitEvent(stream0, prefetch_event)を挿入、captureは無改変』とするが、ggml_backend_cuda_graph_compute(4452)はcudaStreamBeginCapture(stream0,...)(4505)の直後にcompute graphをcaptureする。copy_experts(scheduler:1624)はこのcapture呼び出しより前のschedulerループ内で発行されるが、graph ON・warmup_complete後は cuda_graph_update_required=false となりcaptureをスキップして graph instanceをlaunchするだけ(4493-4500)。この定常launch経路ではschedulerのcopy_experts/event挿入コードは『毎token実行される』が、肝心のexpert copy先(input_cpy)のアドレスはcapture時に焼き付いた固定アドレスで、毎tokenのcopyはcaptureされたgraphの外でstream7に積まれる。stream0のgraph launchがstream7 copyを待つには cudaStreamWaitEvent(stream0,...) を毎token graph launch直前に挿す必要があり、これはscheduler:1678の手前で可能だが、設計は『captured graphのMUL_MAT_IDがcopy完了を待つ』と書きながら実際にはgraph全体の起動を待たせるだけ→前述の通りshexp/attnも一緒に待たされ、隠せる相手が消える。設計の(e)の説明『MUL_MAT_IDだけが待つ』はcaptured graphの内部node単位wait挿入を含意するが、それはcapture改変なしには不可能で自己矛盾。",
+     "severity": "fatal",
+     "evidence": "ggml-cuda.cu:4505 cudaStreamBeginCapture(stream0); 4493-4500 定常時はinstance launchのみ。captured graph内の個別nodeにstream0外eventのwaitを後付けする手段はcapture時にしか無い"
+    },
+    {
+     "flaw": "【stream7 reuse が concurrent_event fork(stream1..n)と衝突しうる + curr_stream_no assert違反リスク】GLM decodeは attn_norm fan-out=3 で concurrent_event を生成(ggml-cuda.cu:4615 min/max_fan_out=3, strstr attn_norm)、stream 1,2,3 へfork、launch時 GGML_ASSERT(curr_stream_no==0)(4243)。設計はstream7を予約し『GLM decodeはstream7をforkしない』と主張するが裏取りなし(n_streams=fan_out=3なので1..3のみ使用、というのが正なら7は空くが、これは設計が未確認と自認)。さらに致命的なのは、concurrent_event経路は use_cuda_graph 経路と排他的に動く(4259-4318)わけではなく capture内に取り込まれる。prefetch streamのevent record/waitをschedulerが毎token発行する一方、graphがconcurrent区間を内包する場合、stream7のcopyとstream1-3のbranch computeが同一stream0 join(4332)を共有しないため、event順序の保証が崩れ、最悪copy未完了のままMUL_MAT_IDが走る競合(silent wrong output)。",
+     "severity": "major",
+     "evidence": "ggml-cuda.cu:4243 GGML_ASSERT(curr_stream_no==0); 4615 min_fan_out=max_fan_out=3; 4246-4248 fork to stream(device,i) i=1..n_streams; 4326-4335 join only re-syncs streams 1..n to stream0"
+    },
+    {
+     "flaw": "【real律速はalphaが触らない — 天井がbaseline≒26と設計自身が認めている】設計のoverlap_budgetが正直に書いている通り、確定事実の律速は『host配置expertをRAM帯域50GB/sで毎token読む』CPU-compute layer。alphaはH2D PCIe copyのみ隠すがそのcopyは律速ではない(前提事実: CPU compute 11msでなくRAM帯域律速、GPUは手待ち)。設計のalpha天井『~27-28 t/s』は実質ノイズ域でbaseline 26.15と区別不能。つまりfatal flaw 1-2でoverlap機構が壊れていなくても、alphaの投資対効果はほぼゼロ。設計は『+39 t/sは楽観』と自認しており、これは設計の自己否定。",
+     "severity": "fatal",
+     "evidence": "前提事実『律速=host配置expertを毎token RAM帯域50GB/sで読む1.7-1.9GB/token。CPU compute(11ms)でなくRAM帯域律速』。設計overlap_budget自身が『alpha barely clears 26』『+39は楽観』と記載"
+    },
+    {
+     "flaw": "【beta two-branch MUL_MAT_ID の get_rows out-of-range が未検証で silent corruption 経路】scheduler:1614 に GGML_ASSERT(id>=0 && id<n_expert) があり、hot分岐(208 expert tensor)に id>=208 を渡すとこのASSERTで即死、cold分岐(48 tensor)に id<208 を渡しても同様。設計は『sentinelでmask』とするが、scheduler の used_ids 構築(1610-1617)は input->ne[2]=208 を n_expert として全idを検証するため、フルtop-8 ids(0..255)をそのまま渡す限りhot tensorに対して必ずASSERT違反。mask前提のidテンソルを別途構築する必要があり、build_moe_ffnの2分岐は『ids自体を分割した2本の別idテンソル』を作らねばならず、設計の『selected_expertsをas-isで使う』記述と矛盾。",
+     "severity": "major",
+     "evidence": "ggml-backend.cpp:1614 GGML_ASSERT(id >= 0 && id < n_expert); n_expert=input->ne[2]=208(hot)。設計beta_designは『hot matmul with selected_experts as-is』と記載し矛盾"
+    },
+    {
+     "flaw": "【pinned前提が222GB working setと両立しない可能性 — alpha/beta共通の土台リスク】async copyがoverlapするにはhost bufがpinned(cudaMallocHost)必須。だが222GB routed weightを --no-mmap でpinned確保するとRAM 125GBを超過し物理的に不可能(前提: RAM 125GB)。確定事実の26.15 t/s構成は『--no-mmap + -ot host』だが、125GB RAMに222GB全体は載らない→mmap併用かlayer部分pinなはず。設計はstaging_decisionで『pinned確認せよ』と保険を張るが、222GB>125GBという算術上、host expert massはpinnableでない領域を含む蓋然性が高く、その場合cudaMemcpyAsyncはdriver staging経由でserialize→alpha/beta共にoverlap=0。",
+     "severity": "major",
+     "evidence": "前提事実 RAM 125GB@50GB/s、全routed expert222GB。設計top_risks自身が『if pageable...alpha gives ~0 gain』と認める。staging fallback ringは121MB×3で焼け石"
+    }
+   ],
+   "required_fixes": [
+    "alpha の overlap 対象を再定義せよ: 同一split内のshexp/attnは隠せない(全て1 captured graphに内包される)。隠せるのは『次のMoE layerのexpert copyを、今のMoE layerのGPU compute中に先読みする』layer-ahead prefetchのみ。これには scheduler が split N の compute launch 前に split N+1 のids/usedを先取りしてstream7にcopyを積む構造が要る=copy_experts経路の根本的なpipeline化(現状のper-split逐次モデルの作り替え)。1ファイルの後付けでは不可能。",
+    "CUDA graph ON 経路では、毎token の stream7 copy 完了を graph launch 前に cudaStreamWaitEvent(stream0, prefetch_event) で待たせる挿入点を scheduler:1678 直前に明示実装し、『captured graph内の個別MUL_MAT_IDだけが待つ』という設計記述を撤回せよ(capture改変なしには個別node待ちは不可能)。graph全体が待つ以上、layer-ahead prefetch(上記)でない限りoverlap利得は出ない。",
+    "GRAPH-STATUS と並んで『現構成で per-token に実際に何splitに割れているか』を GGML_SCHED_DEBUG=2 で実測し、host expert weightがCPU split計算なのかGPU split inputなのかを確定せよ。これがoverlap設計の全前提。設計は『GPU split input』を暗黙仮定しているが、もし-otがMUL_MAT_IDをCPU backendに落としているなら(CPU computeが律速、という前提事実と整合)、stream7 H2D overlap自体が無意味。",
+    "stream7予約の安全性を GGML_LOG_DEBUG の『Launching N streams』ログで実測確認し、concurrent_event が使う stream index 集合(fan_out=3なら1-3)とprefetch streamが排他であることを証明せよ。曖昧なら未使用の高index(例: GGML_CUDA_MAX_STREAMS=8 を増やして専用stream)を確保。",
+    "beta は hot/cold で『ids自体を分割した2本の別idテンソル』(hot_ids = ids where id<208 else sentinel-to-valid-hot, cold_ids = (id-208) where id>=208 else sentinel)を build_moe_ffn 内で構築し、scheduler:1614 ASSERT を通すこと。『selected_experts as-is』は撤回。weight正規化はフルtop-8で行い、out-of-range tokenのoutputを0 maskしてからggml_add。bit-identityテストで必須検証。",
+    "pinned前提を算術で再検証: 222GB > RAM 125GB なので host expert mass全体のpinは物理不能。どのlayer/expertをpinned領域(<125GB)に載せ、残りをどう扱うかの配置設計が先。pinできない部分のcopyはserializeしoverlap 0 になる事実を budget に織り込め。",
+    "alpha は投資対効果ほぼゼロ(天井27前後=baseline 26.15とノイズ域、かつ律速のRAM帯域に未介入)と設計自身が認めている。alphaを独立成果物として実装する判断を撤回し、betaの『hot massをGPUに載せて律速のRAM read自体を消す』を主戦略に据え、alphaのstream機構はbetaのcold tail prefetch部品としてのみ位置づけよ。"
+   ]
+  }
+ ],
+ "plan": {
+  "verdict_summary": "敵対レビュー3観点すべてが survives=false。実コード照合で以下を確認(=レビューの fatal は正しい)。(1) ggml-backend.cpp:1555-1678 で expert H2D copy(1630 ggml_backend_tensor_set_async)と graph_compute_async(1678)は『同一 split・同一ループ反復』。host weight は MUL_MAT_ID の split-input であり、当該 split の compute は1個の captured graph として copy 完了後に一括 launch される。→ 元設計αの『同一層 shexp/attn の裏に copy を隠す』は構造的に不可能(壊れた)。隠せるのは layer-ahead prefetch のみ。(2) ggml-cuda.cu:3143 で copy は cuda_ctx->stream()(=compute stream0)に積まれる。copy↔compute 直列は純粋に same-stream FIFO。→ stream 分離は実在のレバー、ただし下記(3)が前提。(3) 1576-1583 の used-expert copy 経路は『node->op==MUL_MAT_ID かつ node が GPU split に属し input が host buffer』のときだけ発火。現 best 26.15(-ot=CPU 19層)で MUL_MAT_ID が CPU backend で走っているなら copy 経路は不発火=αは完全 no-op。これが未確定で全前提を gate(レビュー3観点が一致して指摘、最重要)。(4) ggml-backend.cpp:1615 GGML_ASSERT(id>=0 && id<n_expert)。βの hot(208)tensor に id>=208 を渡すと即死。『selected_experts as-is』は撤回必須、hot/cold で別 id-tensor + weight zero-mask が要る。weight 正規化は 1482-1496 で full top-8 上で先に行われる→split は正規化後で正しい(順序は救える)。(5) pinned 前提: 222GB > RAM 125GB で host expert mass 全体の pin は物理不能、pageable 部分の side-stream copy は driver staging で直列化=overlap 0。修正:αを独立成果から降格しβの prefetch 部品に再定義、性能 KPI はβ一本化、+39/+77 の楽観値は撤回。実装前に最小実測 de-risk 3本(copy 経路発火確認 / per-layer copy↔compute nsys / pinned 確認)を first step に固定。",
+  "go_no_go": "条件付き GO。ただし『道αを独立した速度ステップとして実装する』判断は NO-GO(撤回)。GO するのは(順序固定): まず DE-RISK 3本(D0 graph-status / D1 copy 経路の発火確認 + per-layer copy↔compute timing 実測 / D2 pinned 確認)を実装ゼロで完走。D1 で『現 26.15 config で MUL_MAT_ID が GPU split に乗り used-expert copy が毎 token 発火し、その copy が compute と同一 stream で直列している』ことを nsys/event timing で確認できた場合に限り、道α’(=stream 分離 + layer-ahead prefetch、後述 revised)へ GO。発火しなければαは一切実装せず即βへ。βは D3(routing histogram)+ D4(hot-only bit-identity 単体検証)を通過してから本実装。いずれの perf 主張も temp=0 固定 seed の bit-identity gate を必須前提とする。",
+  "revised_alpha": "道α’(独立成果から降格、βの cold-tail prefetch インフラとして位置づけ)。元設計の『同一 split 内 shexp/attn の裏に隠す』は撤回(構造的に不可能=同一 captured graph)。新メカニズム=layer-ahead prefetch: split N の compute launch(1678)前に、split N+1 の used-expert H2D copy を専用 prefetch stream に先行投入し、split N の GPU compute(MoE matmul 含む graph 全体)の裏で copy を走らせる。実現には (a) ggml-backend.cpp の per-split 逐次モデルに『次 split の ids を先取り→used 計算→prefetch stream に copy 積み』の look-ahead を入れる(現状の copy_experts ラムダを split ループの外で N+1 先読みできる構造に作り替え)、(b) prefetch stream は専用高 index 確保(GGML_CUDA_MAX_STREAMS を増やすか、concurrent_event の fan_out=3 が使う 1-3 と排他な index を実測で確定してから予約)、(c) graph launch 直前(1678 手前)に cudaStreamWaitEvent(stream0, prefetch_event_N) を毎 token 挿入(『captured graph 内の個別 MUL_MAT_ID だけが待つ』という元記述は撤回、graph 全体が待つ=だから layer-ahead でないと利得ゼロ)、(d) GGML_MOE_PREFETCH=0 で現挙動 fallback。正直な天井: roofline で compute/copy≈0.07(両 GPU 115GB/s)なので完全 overlap でも copy-bound、floor≒copy 時間。かつ現 -ot=CPU config では律速が CPU 計算層の RAM read(50GB/s, 36ms)であり、α’が触る PCIe copy はその律速ではない可能性が高い→α’単独の現実利得は『copy が critical path に乗っていると D1 で実証された分だけ』。+39 は削除。α’は『βで hot を GPU に載せた後、残る cold tail copy を hot 計算裏に隠す』ためにこそ価値が出る。",
+  "revised_beta": "道β(本命に格上げ、律速の RAM read 自体を消す唯一の経路)。元設計の正しさ欠陥を修正。(1) GGUF 前処理 split_moe_experts.py: expert 軸 ne2=256 を byte stride nb[2] で hot[0..207]/cold[208..255] に slice。required assert 追加: 各 expert slab 先頭が量子化 block 境界(IQ2_XS QK=256/IQ3_XXS)に一致 = ne0*ne1 が QK で割り切れ かつ nb[2] % block_size == 0 を数値確認(208/48 の任意境界でも byte-safe を実証)。(2) build_moe_ffn 2分岐の正しさ(修正核心): full top-8 で weight 正規化(1482-1496, 確認済=正規化が先)した後、graph op で hot_ids = where(id<208, id, 0)、hot_w = weights * (id<208 ? 1:0)、cold_ids = where(id>=208, id-208, 0)、cold_w = weights * (id>=208 ? 1:0) の『別 id-tensor 2本 + zero-mask weight 2本』を構築。hot は *_exps(208)に hot_ids、cold は *_exps_cold(48)に cold_ids で MUL_MAT_ID。sentinel(0)に clamp した未使用スロットは weight=0 なので 8-slot 合算(1668-1697)に寄与しない。最後に hot_out + cold_out を ggml_add。『selected_experts as-is』は撤回(1615 ASSERT を通すため clamp 必須)。clamp 後 id が必ず in-range であることを graph 側で保証し GGML_ASSERT 追加。(3) hot を GPU0/GPU1 に分散配置(両 GPU saturation 要件)、cold は host pinned 領域(<125GB に収める配置設計を先に: hot 192GB弱が VRAM、cold 48/256≒18% の host 分は約30GB で 125GB RAM 内 pin 可能か実測)。cold copy はα’の prefetch stream に載せ hot+shared+attn 裏に隠す。(4) deepseek2::graph 共有(models.h:1013)による他 arch 回帰防止: cold 引数は完全 optional default nullptr、glm-dsa 経路のみ非 null。fused gate_up arch を回帰テストに含む。正直な天井: 律速 RAM read が消えれば 55-77 t/s レンジは原理的に到達可能だが、cold アクセス頻度(D3)・pinned 成立(D2)・bit-identity(D4)の3前提が全部通った場合のみ。",
+  "implementation_steps": [
+   {
+    "step": "D0 GRAPH-STATUS 実測",
+    "file": "(計測のみ、ビルドは NDEBUG off or 一時 always-on log)",
+    "detail": "現 best -ot config で短い decode 1 回。stderr を 'disabling CUDA graphs' で grep(ggml-cuda.cu:3256/3270)。GLM-5.2 group-topk MoE decode で graph が ON か確認。OFF なら stream-handshake 前提が変わる(capture が再直列化)ので記録し設計分岐。",
+    "owner": "codex"
+   },
+   {
+    "step": "D1 copy 経路発火 + per-layer copy↔compute timing 実測(αの GO/NO-GO を決める最重要 de-risk)",
+    "file": "ggml/src/ggml-backend.cpp(計測 hook のみ、ロジック不変)",
+    "detail": "GGML_SCHED_DEBUG=2 で現 26.15 config が per-token 何 split に割れ、host expert weight が CPU split 計算か GPU split input かを確定。1576-1583 の used-expert copy 経路が毎 token 発火するか(発火しなければαは no-op)。発火する場合 nsys で copy(stream0)と直後 compute(stream0)が直列していること=隠せる余地があることを timing 確認。実バイト/token を nvidia-smi PCIe RX で実測し天井を引き直す。",
+    "owner": "codex"
+   },
+   {
+    "step": "D2 pinned-host 確認",
+    "file": "ggml/src/ggml-cuda/ggml-cuda.cu:1493-1524 周辺(計測)",
+    "detail": "-ot host expert buffer の buft が ggml_backend_cuda_host_buffer_type(cudaMallocHost)か pageable CPU buf か確認。GGML_CUDA_NO_PINNED 未設定確認。222GB>125GB RAM の算術上どの層/expert が pin 可能領域に載るか配置を確定。pageable なら side-stream copy は serialize→α/β とも overlap 0 を budget に織り込む。",
+    "owner": "codex"
+   },
+   {
+    "step": "D3 routing histogram 実測(βの恒等 split 妥当性 gate)",
+    "file": "ggml/src/ggml-backend.cpp:1610-1617 の used_ids を instrument",
+    "detail": "~200 token で per-token expert-id histogram を出し、恒等 split 208/48 で cold[208-255] アクセス頻度 <20% を確認。skew していたら hot/cold 集合の中身を頻度順に選び直す(恒等 split は『どの expert を hot にするか任意』なので集合選択は自由、ただし graph 側 id remap は必須)。",
+    "owner": "codex"
+   },
+   {
+    "step": "α’ stream 分離 + layer-ahead prefetch 実装(D1 が GO のときのみ)",
+    "file": "ggml/src/ggml-cuda/common.cuh, ggml/src/ggml-cuda/ggml-cuda.cu, ggml/src/ggml-backend.cpp",
+    "detail": "prefetch stream 専用 index 確保(concurrent_event fan_out=3 と排他を D0/log で実測確認後)+ cudaEvent_t prefetch_event。set_tensor_async の stream 限定 clone。copy_experts を split ループ外で N+1 先読みできる構造に作り替え、1678 手前に cudaStreamWaitEvent 挿入。GGML_MOE_PREFETCH=0 fallback。『個別 node だけ待つ』記述は実装しない(graph 全体が待つ)。",
+    "owner": "codex"
+   },
+   {
+    "step": "D4 β hot-only 単体 bit-identity 検証(本 split 前の配線検証)",
+    "file": "src/llama-graph.cpp, src/models/glm-dsa.cpp",
+    "detail": "まず全 expert を hot 配置(cold 空)構成で remap/mask 配線だけ入れ、baseline と temp=0 固定 seed 64-token greedy の token-id 列が byte 一致を確認。配線正しさを 208/48 split 前に単独検証。",
+    "owner": "opus"
+   },
+   {
+    "step": "β GGUF 前処理スクリプト",
+    "file": "gguf-py/scripts/split_moe_experts.py(新規)",
+    "detail": "hot[208]/cold[48] byte slice。block 境界 assert(ne0*ne1 % QK==0, nb[2]%block_size==0)。router 不変、7-file re-shard。",
+    "owner": "codex"
+   },
+   {
+    "step": "β テンソル enum/レイヤ/ロード",
+    "file": "src/llama-arch.h, src/llama-model.h, src/models/glm-dsa.cpp, common/arg.cpp",
+    "detail": "_COLD enum + name string、ffn_*_exps_cold ポインタ、cold tensor 作成(host 配置)、-ot regex で _cold$ を host に pin。",
+    "owner": "codex"
+   },
+   {
+    "step": "β build_moe_ffn 2分岐(正しさ核心)",
+    "file": "src/llama-graph.cpp, src/models/deepseek2.cpp",
+    "detail": "full top-8 正規化後に hot_ids/cold_ids 別 tensor + zero-mask weight 2本構築、2 回 MUL_MAT_ID、clamp で in-range 保証 + ASSERT、最後 ggml_add。cold 引数は optional default nullptr で他 arch 無影響。",
+    "owner": "codex"
+   }
+  ],
+  "first_codex_task": "Self-contained DE-RISK タスク(実装変更ゼロ、計測のみ。これが α の GO/NO-GO を決める)。リポ /home/hikari/src/llama.cpp、build dir build/、conda env llamacpp-cu131、CUDA 13.1、SM120。モデル GLM-5.2 GGUF UD-Q2_K_XL(arch glm-dsa)。現 best decode config = --no-mmap + -ot で 19 層を host(CPU)配置・残り 60 層 GPU(2×RTX PRO 6000)、実測 26.15 t/s。\\n\\n目的: 次の3点を実測で確定し、数値とログ抜粋で報告せよ。\\n(D0) 現 config で CUDA graph が decode 中 ON か。手順: NDEBUG を外したビルド(or ggml/src/ggml-cuda/ggml-cuda.cu:3256 と 3270 の GGML_LOG_DEBUG を一時的に always-on にする)で、短い decode を 1 回流し、stderr を 'disabling CUDA graphs' で grep。どの条件(split buffer / MUL_MAT_ID)が発火したか、または none(=ON)かを報告。\\n(D1) used-expert copy 経路(ggml/src/ggml-backend.cpp:1576-1660)が現 config の decode で毎 token 発火するか。GGML_SCHED_DEBUG=2 で per-token の split 構成を出し、blk.*.ffn_*_exps.weight(host buffer)が『GPU split の MUL_MAT_ID input として copy される』のか『CPU backend で計算され copy されない』のかを判定。発火する場合、nsys(or 1630 set_tensor_async と 1678 graph_compute_async の前後に cudaEventRecord を一時挿入)で、ある MoE 層の expert H2D copy と直後の compute が同一 stream で直列しているか(壁時計が copy+compute か max か)を timing で示せ。さらに 1 token あたり実 PCIe RX バイトを nvidia-smi dmon か nsys で実測。\\n(D2) -ot host expert buffer が pinned(cudaMallocHost 経由 = ggml_backend_cuda_host_buffer_type)か pageable CPU buffer か。起動時に当該 buffer の buft を確認(必要なら ggml-cuda.cu:1493-1524 周辺に一時 log)。GGML_CUDA_NO_PINNED が unset か確認。\\n\\n制約: モデルロードは 4-5 分。1 個の persistent server を warm に保ち、変更は最小。実装ロジックは一切変えない(log/event 挿入のみ)。報告は『D0/D1/D2 それぞれ Yes/No + 根拠ログ抜粋 + 数値』の形で。特に D1 の発火有無は後続判断の分岐点なので断定的に。",
+  "test_protocol": "全 perf 主張の step0 = pinned 確認(D2)と graph-status(D0)。これが No なら overlap 系は破綻なので先に潰す。\\n\\nDE-RISK(実装前、順序固定): D0 graph ON 確認 → D1 copy 経路発火 + copy↔compute 直列 timing(nsys/event)+ PCIe バイト/token 実測 → D2 pinned 確認。D1 で『発火し直列している』が確認できなければ α は実装せず即 β へ。\\n\\nβ 前提検証: D3 expert-id histogram(~200 token)で cold アクセス頻度 <20% → D4 hot-only(cold 空)構成で baseline と temp=0 固定 seed 64-token greedy の token-id 列 byte 一致(remap/mask 配線の単体検証)。\\n\\n正しさ(各実装後、perf 主張の前に必須 gate): 固定 seed temp=0 で baseline binary の 64-token greedy token-id 列を採取。α’ は copy 順序を変えるだけなので bit-identical 必須。β は恒等 split + 正しい weight combine なら identical 必須、divergence = combine/normalization バグ or id out-of-range。\\n\\nPERF(正しさ pass 後のみ): 同一 warm server で 256 token×3 rep の decode t/s を 26.15 と比較。α’ gate = graph ON のまま sustained >26.15(ただし D1 で copy が critical path に乗ると実証された場合のみ意味)。β gate = cold-tail per-token host traffic 低下(nvidia-smi PCIe RX + instrument bytes/token で確認)かつ t/s 上昇。\\n\\n両 GPU saturation: nvidia-smi dmon 30s で β は BOTH GPU >70%(片肺なら hot split が分散していない)。\\n\\nミニマルサイクル: binary variant ごとに 1 server を warm 保持、env(GGML_MOE_PREFETCH)切替は reload なしで回す。",
+  "kill_criteria": "α を捨てる: (1) D1 で現 26.15 config の decode で used-expert copy 経路が発火しない(MUL_MAT_ID が CPU backend で走る)= α は構造的に no-op。(2) D1 で発火しても copy が compute と既に overlap している(直列でない)or copy が critical path でない(律速は CPU 計算層の RAM read)= α 利得ほぼゼロ。(3) D2 で host expert buffer が pageable かつ 222GB>125GB ゆえ pin 不能領域を含む = side-stream copy が driver staging で直列化 = overlap 0。(4) layer-ahead prefetch が per-split 逐次モデルの作り替えを要し blast radius 過大で bit-identity が崩れる。\\n\\nβ を捨て別案へ: (5) D3 で routing が高 id へ skew し、頻度順に hot 集合を選んでも cold アクセス頻度が下げられない(top-8 のうち恒常的に数個が host)。(6) D4 hot-only 単体でも bit-identity が出ない(remap/mask 配線が根本的に MUL_MAT_ID/8-slot 合算と非互換)。(7) hot 192GB弱を 2 GPU に収めつつ cold pinned を 125GB RAM 内に置く配置が成立しない(VRAM or RAM 不足)。\\n\\n両方 kill された場合の別案: SM120 専用 MoE カーネル最適化(MEMORY の project_step37 系で蓄積)or Optane expert paging(構想メモ済)へ pivot。量子化を落とす案は品質理由で却下済(再 litigate しない)。"
+ }
+}

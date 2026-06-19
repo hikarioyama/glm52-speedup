@@ -1,0 +1,4 @@
+llama.cpp master。GGML_OP_MUL_MAT_ID の src0(expert weights)を CUDA_Host buffer(cudaMallocHost, ggml-cuda.cu:1479)に置いたとき、ggml-backend-sched はこの op を CUDA backend に割当てて GPU が UVA で host メモリを直読み計算するか、それとも CPU backend に落ちるか?
+ggml/src/ggml-backend.cpp の ggml_backend_sched_split_graph / backend 割当(buffer location→backend, supports_op, ggml_backend_sched_backend_id_from_cur)を読んで結論。
+CUDA backend の supports_op (ggml-cuda.cu) が src が host buffer の MUL_MAT_ID を true で受けるかも確認。
+結論を「GPU計算/CPU落ち/条件次第」で明示し file:line 根拠を。これが効けば -ot cold=CUDA_Host だけで無ビルド検証できる。簡潔に。
