@@ -7,3 +7,9 @@ harness/sched_overlap
 harness/sched_overlap2
 harness/manual_overlap
 harness/manual_moe_overlap
+harness/out/*.console
+harness/out/*.smaps
+harness/thp_probe
+harness/thp_probe2
+harness/thp_probe3
+harness/thp_probe4
