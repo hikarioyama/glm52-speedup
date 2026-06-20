@@ -1,0 +1,34 @@
+[New LWP 97709]
+[New LWP 97708]
+[New LWP 97707]
+[New LWP 97706]
+[New LWP 97705]
+[New LWP 97704]
+[New LWP 97703]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.archlinux.org>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+0x00007fe83aea0a52 in ?? () from /usr/lib/libc.so.6
+#0  0x00007fe83aea0a52 in ?? () from /usr/lib/libc.so.6
+#1  0x00007fe83ae94abc in ?? () from /usr/lib/libc.so.6
+#2  0x00007fe83ae94b04 in ?? () from /usr/lib/libc.so.6
+#3  0x00007fe83af05c6f in wait4 () from /usr/lib/libc.so.6
+#4  0x00007fe83b94a6ff in ggml_print_backtrace () from /home/hikari/src/llama.cpp/build/bin/libggml-base.so.0
+#5  0x00007fe83b94a87e in ggml_abort () from /home/hikari/src/llama.cpp/build/bin/libggml-base.so.0
+#6  0x00007fe83b74154a in llama_model_loader::create_tensor(llama_hparams const&, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, LLM_TN_IMPL const&, std::initializer_list<long> const&, int)::{lambda(ggml_tensor*)#1}::operator()(ggml_tensor*) const () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#7  0x00007fe83b741811 in llama_model_loader::create_tensor(llama_hparams const&, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, std::vector<std::pair<ggml_backend_device*, ggml_backend_buffer_type*>, std::allocator<std::pair<ggml_backend_device*, ggml_backend_buffer_type*> > > const*, LLM_TN_IMPL const&, std::initializer_list<long> const&, int) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#8  0x00007fe83b747a74 in llama_model_base::create_tensor(llama_model_loader&, LLM_TN_IMPL const&, std::initializer_list<long> const&, int) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#9  0x00007fe83b7f8bbd in llama_model_glm_dsa::load_arch_tensors(llama_model_loader&) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#10 0x00007fe83b751146 in llama_model_base::load_tensors(llama_model_loader&) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#11 0x00007fe83b69118c in llama_model_load(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params&) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#12 0x00007fe83b6923eb in llama_model_load_from_file_impl(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params) () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#13 0x00007fe83b6933b1 in llama_model_load_from_file () from /home/hikari/src/llama.cpp/build/bin/libllama.so.0
+#14 0x00007fe83bbd15df in common_init_result::common_init_result(common_params&) () from /home/hikari/src/llama.cpp/build/bin/libllama-common.so.0
+#15 0x00007fe83bbd6033 in common_init_from_params(common_params&) () from /home/hikari/src/llama.cpp/build/bin/libllama-common.so.0
+#16 0x0000563f780fbadb in main ()
+[Inferior 1 (process 97701) detached]

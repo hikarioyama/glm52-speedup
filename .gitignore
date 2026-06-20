@@ -13,3 +13,5 @@ harness/thp_probe
 harness/thp_probe2
 harness/thp_probe3
 harness/thp_probe4
+__pycache__/
+*.pyc
