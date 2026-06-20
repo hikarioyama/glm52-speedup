@@ -15,3 +15,7 @@ harness/thp_probe3
 harness/thp_probe4
 __pycache__/
 *.pyc
+harness/frag_bench
+harness/moe_bench
+harness/read_bw
+harness/vec_dot_bench
